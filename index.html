@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Question Bank Viewer</title>
+<link rel="stylesheet" href="vendor/katex.min.css">
+<link rel="stylesheet" href="style.css">
+<script src="vendor/katex.min.js"></script>
+<script src="vendor/xlsx.full.min.js"></script>
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <span class="logo">Σ</span>
+    <div>
+      <h1>Question Bank Viewer</h1>
+      <p class="sub" id="fileInfo">Upload a bulk-import sheet to preview it</p>
+    </div>
+  </div>
+  <div class="top-actions">
+    <label class="btn" for="fileInput">Upload file</label>
+    <input type="file" id="fileInput" accept=".xlsx,.xls,.xlsm,.ods,.csv,.tsv" multiple hidden>
+    <button class="btn ghost" id="linkBtn" type="button">Open Google Sheet link</button>
+    <button class="btn ghost" id="themeBtn" type="button" title="Toggle dark mode">◐</button>
+  </div>
+</header>
+
+<section id="landing" class="landing">
+  <div class="drop" id="dropZone">
+    <div class="drop-icon">⬆</div>
+    <h2>Drop your question sheet here</h2>
+    <p>.xlsx / .ods / .csv — the Chapter · Topic · Concept · Group · Question bulk-import format.<br>
+      In Google Sheets use <b>File → Download → Microsoft Excel (.xlsx)</b> so every tab (Objective, Descriptive, Subjective) comes along.</p>
+    <label class="btn big" for="fileInput">Choose file</label>
+    <div class="or">or</div>
+    <form id="linkForm" class="link-form">
+      <input id="linkInput" type="url" placeholder="Paste a Google Sheets link (sheet must be shared: Anyone with the link)">
+      <button class="btn" type="submit">Load</button>
+    </form>
+    <p class="err" id="loadErr"></p>
+  </div>
+</section>
+
+<main id="viewer" class="viewer" hidden>
+  <aside class="sidebar" id="sidebar">
+    <div class="side-head">
+      <span>Structure</span>
+      <button class="link" id="clearTree" type="button">Show all</button>
+    </div>
+    <nav id="tree" class="tree"></nav>
+  </aside>
+
+  <section class="content">
+    <div class="toolbar">
+      <input id="search" type="search" placeholder="Search question text, label, answer…">
+      <select id="fType"><option value="">All sheets</option></select>
+      <select id="fCat"><option value="">All categories</option></select>
+      <select id="fDiff"><option value="">All difficulty</option></select>
+      <select id="fGroupType"><option value="">All group levels</option></select>
+      <div class="toggles">
+        <label><input type="checkbox" id="tAns" checked> Answers</label>
+        <label><input type="checkbox" id="tMark" checked> Marking</label>
+        <label><input type="checkbox" id="tMeta"> Metadata</label>
+        <label><input type="checkbox" id="tRaw"> Raw source</label>
+      </div>
+    </div>
+    <div class="summary" id="summary"></div>
+    <div id="issues" class="issues" hidden></div>
+    <div id="list" class="list"></div>
+  </section>
+</main>
+
+<div id="lightbox" class="lightbox" hidden><img alt=""><p></p></div>
+<script src="app.js"></script>
+</body>
+</html>
