@@ -14,7 +14,15 @@
  *      Group row, then each unique Concept row, then each unique Topic row,
  *      then the Chapter row (collected from all sheets, duplicates removed).
  *
- * Menu "Master Format" → "Expanded → Compact" / "Compact → Expanded".
+ * Three ways to run it:
+ *  1. Bound to a Google Sheet (Extensions → Apps Script):
+ *       menu "Master Format" → "Expanded → Compact" / "Compact → Expanded".
+ *  2. Standalone project (script.google.com) for .xlsx files in Drive:
+ *       set FILE_URL below, then run fileToCompact or fileToExpanded.
+ *  3. Standalone project deployed as a Web app: paste a Drive link in the page.
+ *
+ *  In modes 2 and 3 the original file is never changed. A converted copy is
+ *  saved next to it: an .xlsx stays .xlsx, a Google Sheet stays a Google Sheet.
  */
 
 // Sheet that receives the Group / Concept / Topic / Chapter rows in COMPACT form.
@@ -22,6 +30,16 @@ var META_SHEET = 'Descriptive';
 var HEADER_ROW = 2;        // row holding the column names
 var FIRST_DATA_ROW = 3;    // first data row
 var LIST_SEP = '|';        // separator used in *_labels / *_topics cells
+
+// Mode 2: link (or ID) of the Drive file to convert.
+var FILE_URL = 'PASTE_DRIVE_FILE_LINK_HERE';
+
+var XLSX_MIME = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
+var GSHEET_MIME = 'application/vnd.google-apps.spreadsheet';
+
+/* ------------------------------------------------------------------ */
+/* Mode 1: menu inside a Google Sheet                                  */
+/* ------------------------------------------------------------------ */
 
 function onOpen() {
   SpreadsheetApp.getUi()
@@ -31,27 +49,135 @@ function onOpen() {
     .addToUi();
 }
 
-/* ------------------------------------------------------------------ */
-/* Menu entry points                                                   */
-/* ------------------------------------------------------------------ */
-
 function convertToCompact() {
-  runConversion_(toCompact_, 'Expanded → Compact');
+  convertActive_('compact');
 }
 
 function convertToExpanded() {
-  runConversion_(toExpanded_, 'Compact → Expanded');
+  convertActive_('expanded');
 }
 
-function runConversion_(convertFn, label) {
+function convertActive_(direction) {
   var ss = SpreadsheetApp.getActiveSpreadsheet();
-  var ui = SpreadsheetApp.getUi();
-  var sheets = ss.getSheets();
+  try {
+    convertSpreadsheet_(ss, direction);
+    ss.toast(directionLabel_(direction) + ' done.', 'Master Format', 5);
+  } catch (e) {
+    SpreadsheetApp.getUi().alert(e.message);
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/* Mode 2: run from the script editor on a Drive file (.xlsx or Sheet) */
+/* ------------------------------------------------------------------ */
+
+function fileToCompact() {
+  Logger.log('Saved: ' + convertDriveFile(FILE_URL, 'compact'));
+}
+
+function fileToExpanded() {
+  Logger.log('Saved: ' + convertDriveFile(FILE_URL, 'expanded'));
+}
+
+/* ------------------------------------------------------------------ */
+/* Mode 3: web app                                                     */
+/* ------------------------------------------------------------------ */
+
+function doGet() {
+  return HtmlService.createHtmlOutput(
+    '<div style="font-family:sans-serif;max-width:560px;margin:24px auto">' +
+    '<h3>Master format converter</h3>' +
+    '<p>Drive link of the .xlsx or Google Sheet:</p>' +
+    '<input id="u" style="width:100%;padding:6px">' +
+    '<p><button onclick="go(\'compact\')">Expanded → Compact</button> ' +
+    '<button onclick="go(\'expanded\')">Compact → Expanded</button></p>' +
+    '<p id="s"></p></div>' +
+    '<script>function go(d){var s=document.getElementById("s");s.textContent="Working…";' +
+    'google.script.run.withSuccessHandler(function(u){s.innerHTML=' +
+    '"Done: <a target=_blank href=\\""+u+"\\">open converted file</a>";})' +
+    '.withFailureHandler(function(e){s.textContent="Error: "+e.message;})' +
+    '.convertDriveFile(document.getElementById("u").value,d);}</script>'
+  ).setTitle('Master format converter');
+}
+
+/**
+ * Converts a Drive file (.xlsx or Google Sheet) and saves the result as a new
+ * file in the same folder. Returns the new file's URL.
+ */
+function convertDriveFile(urlOrId, direction) {
+  var id = fileIdFromUrl_(urlOrId);
+  var src = DriveApp.getFileById(id);
+  var mime = src.getMimeType();
+  if (mime !== XLSX_MIME && mime !== GSHEET_MIME) {
+    throw new Error('Not an .xlsx or Google Sheet: ' + src.getName());
+  }
+  var baseName = src.getName().replace(/\.xlsx$/i, '');
+  var suffix = direction === 'compact' ? ' (Compact)' : ' (Expanded)';
+  var parents = src.getParents();
+  var folder = parents.hasNext() ? parents.next() : DriveApp.getRootFolder();
+
+  // Working copy as a Google Sheet (.xlsx is converted by the Drive API).
+  var tmpId = driveApi_('post', id + '/copy?supportsAllDrives=true', {
+    name: baseName + suffix,
+    mimeType: GSHEET_MIME,
+    parents: [folder.getId()]
+  }).id;
+
+  convertSpreadsheet_(SpreadsheetApp.openById(tmpId), direction);
+  SpreadsheetApp.flush();
+
+  if (mime === GSHEET_MIME) {
+    return DriveApp.getFileById(tmpId).getUrl();
+  }
+
+  // Original was .xlsx: export back to .xlsx and remove the working copy.
+  var blob = UrlFetchApp.fetch(
+    'https://www.googleapis.com/drive/v3/files/' + tmpId +
+      '/export?mimeType=' + encodeURIComponent(XLSX_MIME),
+    { headers: { Authorization: 'Bearer ' + ScriptApp.getOAuthToken() } }
+  ).getBlob().setName(baseName + suffix + '.xlsx');
+  var out = folder.createFile(blob);
+  DriveApp.getFileById(tmpId).setTrashed(true);
+  return out.getUrl();
+}
+
+function driveApi_(method, path, body) {
+  var res = UrlFetchApp.fetch('https://www.googleapis.com/drive/v3/files/' + path, {
+    method: method,
+    contentType: 'application/json',
+    payload: JSON.stringify(body),
+    headers: { Authorization: 'Bearer ' + ScriptApp.getOAuthToken() },
+    muteHttpExceptions: true
+  });
+  if (res.getResponseCode() >= 300) {
+    throw new Error('Drive API error: ' + res.getContentText());
+  }
+  return JSON.parse(res.getContentText());
+}
+
+function fileIdFromUrl_(urlOrId) {
+  var s = String(urlOrId).trim();
+  var m = s.match(/\/d\/([a-zA-Z0-9_-]+)/) || s.match(/[?&]id=([a-zA-Z0-9_-]+)/);
+  if (m) return m[1];
+  if (/^[a-zA-Z0-9_-]{20,}$/.test(s)) return s;
+  throw new Error('Could not read a Drive file ID from: ' + s);
+}
+
+/* ------------------------------------------------------------------ */
+/* Core: read sheets, convert, write back                              */
+/* ------------------------------------------------------------------ */
+
+function directionLabel_(direction) {
+  return direction === 'compact' ? 'Expanded → Compact' : 'Compact → Expanded';
+}
+
+function convertSpreadsheet_(ss, direction) {
+  var convertFn = direction === 'compact' ? toCompact_ : toExpanded_;
 
   // Read every sheet's data block (rows from FIRST_DATA_ROW down).
   var input = {};
   var order = [];
-  sheets.forEach(function (sh) {
+  ss.getSheets().forEach(function (sh) {
     var lastCol = sh.getLastColumn();
     if (lastCol === 0 || sh.getLastRow() < HEADER_ROW) return;
     var header = sh.getRange(HEADER_ROW, 1, 1, lastCol).getValues()[0];
@@ -65,8 +191,7 @@ function runConversion_(convertFn, label) {
   });
 
   if (!input[META_SHEET]) {
-    ui.alert('Sheet "' + META_SHEET + '" with a question_label column was not found.');
-    return;
+    throw new Error('Sheet "' + META_SHEET + '" with a question_label column was not found.');
   }
 
   var output = convertFn(input, order);
@@ -83,8 +208,6 @@ function runConversion_(convertFn, label) {
       sh.getRange(FIRST_DATA_ROW, 1, newRows.length, width).setValues(newRows);
     }
   });
-
-  ss.toast(label + ' done.', 'Master Format', 5);
 }
 
 /* ------------------------------------------------------------------ */
