@@ -264,6 +264,36 @@ function put_(row, range, cells) {
   for (var i = 0; i < cells.length; i++) row[range[0] + i] = cells[i];
 }
 
+/**
+ * Reads one block (chapter / topic / concept / group) of a row as
+ * { column_name: value }, so it can be written to a sheet whose columns are
+ * in a different order (e.g. Descriptive vs Objective group columns).
+ */
+function getBlock_(row, header, range) {
+  var obj = {};
+  for (var i = range[0]; i < range[1]; i++) {
+    var name = String(header[i]).trim();
+    if (name !== '' && !(name in obj)) obj[name] = row[i];
+  }
+  return obj;
+}
+
+/** Writes a block into a row, matching columns by name. */
+function putBlock_(row, header, range, obj) {
+  for (var i = range[0]; i < range[1]; i++) {
+    var name = String(header[i]).trim();
+    if (name in obj) row[i] = obj[name];
+  }
+}
+
+function isBlankBlock_(obj) {
+  return Object.keys(obj).every(function (k) { return obj[k] === '' || obj[k] === null; });
+}
+
+function blockKey_(obj) {
+  return JSON.stringify(Object.keys(obj).sort().map(function (k) { return [k, obj[k]]; }));
+}
+
 function splitList_(value) {
   return String(value).split(LIST_SEP).map(function (s) { return s.trim(); })
     .filter(function (s) { return s !== ''; });
@@ -296,21 +326,21 @@ function toCompact_(input, order) {
         out[name].push(qRow);
       }
       ['group', 'concept', 'topic', 'chapter'].forEach(function (k) {
-        var cells = slice_(row, L[k]);
-        if (isBlank_(cells)) return;
-        var key = JSON.stringify(cells);
+        var block = getBlock_(row, sheet.header, L[k]);
+        if (isBlankBlock_(block)) return;
+        var key = blockKey_(block);
         if (seen[k][key]) return;
         seen[k][key] = true;
-        blocks[k].push(cells);
+        blocks[k].push(block);
       });
     });
   });
 
-  var metaWidth = input[META_SHEET].header.length;
+  var metaHeader = input[META_SHEET].header;
   ['group', 'concept', 'topic', 'chapter'].forEach(function (k) {
-    blocks[k].forEach(function (cells) {
-      var r = emptyRow_(metaWidth);
-      put_(r, metaLayout[k], cells);
+    blocks[k].forEach(function (block) {
+      var r = emptyRow_(metaHeader.length);
+      putBlock_(r, metaHeader, metaLayout[k], block);
       out[META_SHEET].push(r);
     });
   });
@@ -330,21 +360,20 @@ function toExpanded_(input, order) {
     sheet.rows.forEach(function (row) {
       if (!isBlank_(slice_(row, L.question))) return;
       ['group', 'concept', 'topic', 'chapter'].forEach(function (k) {
-        var cells = slice_(row, L[k]);
-        if (!isBlank_(cells)) meta[k].push(cells);
+        var block = getBlock_(row, sheet.header, L[k]);
+        if (!isBlankBlock_(block)) meta[k].push(block);
       });
     });
   });
 
   var mL = layout_(input[META_SHEET].header);
-  var col = function (k, name) { return mL.idx(name) - mL[k][0]; };
-  var gLabels = col('group', 'group_question_labels');
-  var cTitle = col('concept', 'concept_title');
-  var cLabels = col('concept', 'concept_question_labels');
-  var tTitle = col('topic', 'topic_title');
-  var tConcepts = col('topic', 'topic_concept_labels');
-  var chPre = col('chapter', 'pre_topics');
-  var chPost = col('chapter', 'post_topics');
+  var gLabels = 'group_question_labels';
+  var cTitle = 'concept_title';
+  var cLabels = 'concept_question_labels';
+  var tTitle = 'topic_title';
+  var tConcepts = 'topic_concept_labels';
+  var chPre = 'pre_topics';
+  var chPost = 'post_topics';
 
   var used = {};
   var findGroup = function (qLabel) {
@@ -378,14 +407,14 @@ function toExpanded_(input, order) {
     return null;
   };
 
-  var fill = function (row, L, qLabel, group) {
+  var fill = function (row, header, L, qLabel, group) {
     var concept = findConcept(qLabel);
     var topic = findTopic(concept);
     var chapter = findChapter(topic);
-    if (group) put_(row, L.group, group);
-    if (concept) put_(row, L.concept, concept);
-    if (topic) put_(row, L.topic, topic);
-    if (chapter) put_(row, L.chapter, chapter);
+    if (group) putBlock_(row, header, L.group, group);
+    if (concept) putBlock_(row, header, L.concept, concept);
+    if (topic) putBlock_(row, header, L.topic, topic);
+    if (chapter) putBlock_(row, header, L.chapter, chapter);
   };
 
   // 2. Rebuild each sheet's question rows with their parent columns.
@@ -401,18 +430,18 @@ function toExpanded_(input, order) {
       var qLabel = String(row[qLabelCol]).trim();
       var gi = findGroup(qLabel);
       if (gi !== -1) used[gi] = true;
-      fill(r, L, qLabel, gi !== -1 ? meta.group[gi] : null);
+      fill(r, sheet.header, L, qLabel, gi !== -1 ? meta.group[gi] : null);
       out[name].push(r);
     });
   });
 
   // 3. Groups no question row picked up stay as group-only rows (with parents).
-  var width = input[META_SHEET].header.length;
+  var metaHeader = input[META_SHEET].header;
   meta.group.forEach(function (g, i) {
     if (used[i]) return;
-    var r = emptyRow_(width);
+    var r = emptyRow_(metaHeader.length);
     var firstQ = splitList_(g[gLabels])[0] || '';
-    fill(r, mL, firstQ, g);
+    fill(r, metaHeader, mL, firstQ, g);
     out[META_SHEET].push(r);
   });
   return out;
