@@ -881,58 +881,108 @@ window.addEventListener('beforeunload', e => { if (pending.size) { e.preventDefa
 
 /* ---------------- save back to Google Sheets (via a small Apps Script web app in the sheet) ---------------- */
 const APPS_SCRIPT = `/**
- * Question Bank Viewer – save-back script.
- * Lets the viewer write edited cells back into THIS spreadsheet.
- * Setup: Extensions → Apps Script → paste this → Deploy → New deployment →
- *        type "Web app", Execute as "Me", Who has access "Anyone" → Deploy → copy the Web app URL.
+ * Question Bank Viewer – save script.
+ * Lets the viewer write edited cells back into Google Sheets AND .xlsx files stored in Google Drive
+ * (any file your account can edit). Set it up once:
+ *   script.google.com → New project → paste this → Save → Deploy → New deployment →
+ *   type "Web app", Execute as "Me", Who has access "Anyone" → Deploy → copy the Web app URL into the viewer.
  */
-function doGet() {
-  var ss = SpreadsheetApp.getActiveSpreadsheet();
-  return json_({ok: true, id: ss.getId(), name: ss.getName()});
+var KEY = '%%KEY%%'; // only the viewer that gave you this script knows this key
+var SHEET_MIME = 'application/vnd.google-apps.spreadsheet';
+var XLSX_MIME = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
+
+function doGet(e) { return run_(JSON.parse((e && e.parameter && e.parameter.q) || '{}')); }
+function doPost(e) { return run_(JSON.parse(e.postData.contents)); }
+
+function run_(req) {
+  try {
+    if (req.key !== KEY) return json_({ok: false, badKey: true, error: 'The key does not match this script.'});
+    if (!req.id) return json_({ok: true, ready: true});
+    var file = DriveApp.getFileById(req.id);
+    var mime = file.getMimeType();
+    if (mime !== SHEET_MIME && mime !== XLSX_MIME) {
+      return json_({ok: false, error: '"' + file.getName() + '" is not a Google Sheet or an .xlsx file.'});
+    }
+    if (!req.changes) return json_({ok: true, name: file.getName(), kind: mime === SHEET_MIME ? 'sheet' : 'xlsx'});
+    var lock = LockService.getScriptLock();
+    lock.waitLock(60000);
+    try {
+      return json_(mime === SHEET_MIME ? saveSheet_(file, req) : saveXlsx_(file, req));
+    } finally {
+      lock.releaseLock();
+    }
+  } catch (err) {
+    return json_({ok: false, error: String((err && err.message) || err)});
+  }
 }
 
-function doPost(e) {
-  var lock = LockService.getDocumentLock();
-  lock.waitLock(30000);
+function saveSheet_(file, req) {
+  var results = apply_(SpreadsheetApp.openById(file.getId()), req);
+  SpreadsheetApp.flush();
+  return {ok: true, name: file.getName(), results: results};
+}
+
+// .xlsx: edit a temporary Google Sheets copy, then write it back into the same .xlsx file (the link stays the same).
+function saveXlsx_(file, req) {
+  var auth = {Authorization: 'Bearer ' + ScriptApp.getOAuthToken()};
+  var api = 'https://www.googleapis.com/drive/v3/files/';
+  var tmp = JSON.parse(UrlFetchApp.fetch(api + file.getId() + '/copy?supportsAllDrives=true', {
+    method: 'post', contentType: 'application/json', headers: auth,
+    payload: JSON.stringify({name: 'temp copy – ' + file.getName(), mimeType: SHEET_MIME})
+  }).getContentText()).id;
   try {
-    var req = JSON.parse(e.postData.contents);
-    var ss = SpreadsheetApp.getActiveSpreadsheet();
-    if (req.id && req.id !== ss.getId()) {
-      return json_({ok: false, error: 'This save link belongs to a different spreadsheet ("' + ss.getName() + '").'});
+    var results = apply_(SpreadsheetApp.openById(tmp), req);
+    if (results.some(function (r) { return r.ok; })) {
+      SpreadsheetApp.flush();
+      var xlsx = UrlFetchApp.fetch(api + tmp + '/export?mimeType=' + encodeURIComponent(XLSX_MIME), {headers: auth}).getBlob();
+      UrlFetchApp.fetch('https://www.googleapis.com/upload/drive/v3/files/' + file.getId() + '?uploadType=media&supportsAllDrives=true', {
+        method: 'patch', contentType: XLSX_MIME, headers: auth, payload: xlsx.getBytes()
+      });
     }
-    var results = (req.changes || []).map(function (c) {
-      var sh = ss.getSheetByName(c.sheet) || ss.getSheets()[c.tab];
-      if (!sh) return {ok: false, error: 'Tab "' + c.sheet + '" not found'};
-      var cell = sh.getRange(c.row, c.col);
-      var shown = String(cell.getDisplayValue()), raw = String(cell.getValue());
-      if (!req.force && norm_(shown) !== norm_(c.old) && norm_(raw) !== norm_(c.old)) {
-        return {ok: false, conflict: true, current: shown};
-      }
-      var v = String(c.value);
-      cell.setValue(/^[=+@]/.test(v) ? "'" + v : v);
-      return {ok: true};
-    });
-    SpreadsheetApp.flush();
-    return json_({ok: true, name: ss.getName(), results: results});
-  } catch (err) {
-    return json_({ok: false, error: String(err)});
+    return {ok: true, name: file.getName(), results: results};
   } finally {
-    lock.releaseLock();
+    DriveApp.getFileById(tmp).setTrashed(true);
   }
+}
+
+function apply_(ss, req) {
+  var tabs = ss.getSheets();
+  return (req.changes || []).map(function (c) {
+    var sh = ss.getSheetByName(c.sheet) || tabs[c.tab];
+    if (!sh) return {ok: false, error: 'Tab "' + c.sheet + '" not found'};
+    var cell = sh.getRange(c.row, c.col);
+    var shown = String(cell.getDisplayValue()), raw = String(cell.getValue());
+    if (!req.force && norm_(shown) !== norm_(c.old) && norm_(raw) !== norm_(c.old)) {
+      return {ok: false, conflict: true, current: shown};
+    }
+    var v = String(c.value);
+    cell.setValue(/^[=+@]/.test(v) ? "'" + v : v);
+    return {ok: true};
+  });
 }
 
 function norm_(s) { return String(s == null ? '' : s).replace(/\\s+/g, ' ').trim(); }
 function json_(o) { return ContentService.createTextOutput(JSON.stringify(o)).setMimeType(ContentService.MimeType.JSON); }
 `;
-const saveUrlKey = id => 'qv-save-' + id;
-function getSaveUrl(id) { try { return localStorage.getItem(saveUrlKey(id)) || ''; } catch (_) { return state.saveUrls?.[id] || ''; } }
-function setSaveUrl(id, url) { (state.saveUrls ||= {})[id] = url; try { url ? localStorage.setItem(saveUrlKey(id), url) : localStorage.removeItem(saveUrlKey(id)); } catch (_) {} }
+/** One save script serves every sheet, so the connection (web-app URL + key) is stored once per browser. */
+const store = {
+  get(k) { try { return localStorage.getItem(k) || state.mem?.[k] || ''; } catch (_) { return state.mem?.[k] || ''; } },
+  set(k, v) { (state.mem ||= {})[k] = v; try { v ? localStorage.setItem(k, v) : localStorage.removeItem(k); } catch (_) {} },
+};
+const getConn = () => ({url: store.get('qv-save-url'), key: store.get('qv-save-key')});
+function scriptKey() {
+  let k = store.get('qv-save-key');
+  if (!k) { k = [...crypto.getRandomValues(new Uint8Array(18))].map(b => b.toString(16).padStart(2, '0')).join(''); store.set('qv-save-key', k); }
+  return k;
+}
+const scriptText = () => APPS_SCRIPT.replace('%%KEY%%', scriptKey());
 const isScriptUrl = u => /^https:\/\/script\.google(usercontent)?\.com\/.*\/exec(\?.*)?$/.test(str(u));
 
-async function callScript(url, body) {
+async function callScript(url, body, post = true) {
   let res;
   try {
-    res = body ? await fetch(url, {method: 'POST', headers: {'Content-Type': 'text/plain;charset=utf-8'}, body: JSON.stringify(body)}) : await fetch(url);
+    res = post ? await fetch(url, {method: 'POST', headers: {'Content-Type': 'text/plain;charset=utf-8'}, body: JSON.stringify(body)})
+               : await fetch(url + (url.includes('?') ? '&' : '?') + 'q=' + encodeURIComponent(JSON.stringify(body)));
   } catch (e) { throw new Error('Could not reach the save link. Check that it was deployed with Who has access: "Anyone".'); }
   const text = await res.text();
   try { return JSON.parse(text); } catch (_) {
@@ -942,57 +992,63 @@ async function callScript(url, body) {
 
 function openGoogleSetup(thenSave = false) {
   const f = state.files.find(x => x.gsheet); if (!f) return;
-  const cur = getSaveUrl(f.gsheet);
-  const d = dialog(`<h3>Connect the Google Sheet for saving</h3>
-    <p>Google only lets a sheet be changed by something its owner has approved. This one-time setup adds a small script to <b>your</b> sheet that lets this viewer save edits into it. Ask the sheet's owner (or someone with edit access) to do it.</p>
+  const conn = getConn();
+  const d = dialog(`<h3>Connect saving to Google Drive</h3>
+    <p>Google only lets files be changed by something you have approved. This one-time setup creates a small script in <b>your</b> Google account that lets this viewer save edits. It works for every Google Sheet and every <b>.xlsx</b> file in Drive that your account can edit — you do it once, not per sheet.</p>
     <ol class="steps">
-      <li>Open the Google Sheet. In the menu choose <b>Extensions → Apps Script</b>.</li>
-      <li>Delete everything in the code box, then paste the script below (use the <b>Copy script</b> button). Click the 💾 <b>Save</b> icon.</li>
+      <li>Open <a href="https://script.google.com/home/projects/create" target="_blank" rel="noopener"><b>script.google.com → New project</b></a> (signed in with the account that can edit the sheet).</li>
+      <li>Delete everything in the code box, then paste the script (use the <b>Copy script</b> button below). Click the 💾 <b>Save</b> icon.</li>
       <li>Click <b>Deploy → New deployment</b>. Click the ⚙ gear next to “Select type” and choose <b>Web app</b>.</li>
       <li>Set <b>Execute as: Me</b> and <b>Who has access: Anyone</b>. Click <b>Deploy</b>.</li>
-      <li>Click <b>Authorize access</b> and choose your Google account. If you see “Google hasn’t verified this app”, click <b>Advanced → Go to … (unsafe)</b> → <b>Allow</b>. (It is your own script, so this is expected.)</li>
+      <li>Click <b>Authorize access</b> and choose your Google account. If you see “Google hasn’t verified this app”, click <b>Advanced → Go to … (unsafe)</b> → <b>Allow</b>. (It is your own script, so this is expected. It asks for Drive access because it saves into your files.)</li>
       <li>Copy the <b>Web app URL</b> (it ends in <code>/exec</code>) and paste it here:</li>
     </ol>
-    <div class="link-form"><input id="gsUrl" type="url" placeholder="https://script.google.com/macros/s/…/exec" value="${esc(cur)}"><button class="btn" type="button" id="gsConnect">Connect</button></div>
+    <div class="dlg-act"><button class="btn" type="button" id="gsCopy">Copy script</button></div>
+    <div class="link-form" style="margin-top:12px"><input id="gsUrl" type="url" placeholder="https://script.google.com/macros/s/…/exec" value="${esc(conn.url)}"><button class="btn" type="button" id="gsConnect">Connect</button></div>
+    <div id="gsKeyRow" hidden><p class="small">This script was copied in a different browser. Open it in Apps Script and paste the text between the quotes on the line <code>var KEY = '…'</code>:</p>
+      <div class="link-form"><input id="gsKey" type="text" placeholder="key" value=""></div></div>
     <p class="err" id="gsErr"></p><p class="ok-msg" id="gsOk"></p>
-    <details class="code"><summary>Show the script</summary><pre>${esc(APPS_SCRIPT)}</pre></details>
-    <div class="dlg-act"><button class="btn ghost" type="button" id="gsCopy">Copy script</button>
-      <button class="btn ghost" type="button" id="gsShare" ${cur ? '' : 'hidden'}>Copy link for colleagues</button>
-      ${cur ? `<button class="btn ghost" type="button" id="gsForget">Disconnect</button>` : ''}</div>
-    <p class="muted small">Anyone who has the Web app URL (or the colleagues link) can save changes to this sheet, so share it only with people who should edit. Changes appear in the sheet's version history.</p>`, 'wide');
-  $('#gsCopy').onclick = () => { navigator.clipboard?.writeText(APPS_SCRIPT).then(() => toast('Script copied — paste it in Apps Script'), () => toast('Copy failed — use “Show the script”', true)); };
+    <details class="code"><summary>Show the script</summary><pre>${esc(scriptText())}</pre></details>
+    <div class="dlg-act"><button class="btn ghost" type="button" id="gsShare" ${conn.url ? '' : 'hidden'}>Copy link for colleagues</button>
+      ${conn.url ? `<button class="btn ghost" type="button" id="gsForget">Disconnect</button>` : ''}</div>
+    <p class="muted small">Anyone who has the colleagues link can save changes to this file, so share it only with people who should edit. Earlier versions stay in the file's version history (File → Version history).</p>`, 'wide');
+  $('#gsCopy').onclick = () => { navigator.clipboard?.writeText(scriptText()).then(() => toast('Script copied — paste it in Apps Script'), () => toast('Copy failed — use “Show the script”', true)); };
   $('#gsShare').onclick = () => {
-    const link = location.origin + location.pathname + '#sheet=' + f.gsheet + '&save=' + encodeURIComponent(getSaveUrl(f.gsheet));
+    const c = getConn();
+    const link = location.origin + location.pathname + '#sheet=' + f.gsheet + '&save=' + encodeURIComponent(c.url) + '&key=' + c.key;
     navigator.clipboard?.writeText(link).then(() => toast('Link copied — colleagues who open it can edit and save'));
   };
-  if ($('#gsForget')) $('#gsForget').onclick = () => { setSaveUrl(f.gsheet, ''); d.close(); toast('Disconnected'); };
+  if ($('#gsForget')) $('#gsForget').onclick = () => { store.set('qv-save-url', ''); d.close(); toast('Disconnected'); };
   $('#gsConnect').onclick = async () => {
-    const url = str($('#gsUrl').value);
+    const url = str($('#gsUrl').value), key = str($('#gsKey').value) || scriptKey();
     $('#gsErr').textContent = ''; $('#gsOk').textContent = '';
     if (!isScriptUrl(url)) { $('#gsErr').textContent = 'That is not an Apps Script Web app URL — it should start with https://script.google.com/ and end with /exec.'; return; }
     $('#gsConnect').disabled = true; $('#gsConnect').textContent = 'Checking…';
     try {
-      const j = await callScript(url);
+      const j = await callScript(url, {key, id: f.gsheet}, false);
+      if (j.badKey) { $('#gsKeyRow').hidden = false; throw new Error('The key does not match this script — see the box above.'); }
       if (!j.ok) throw new Error(j.error || 'The script did not answer.');
-      if (j.id !== f.gsheet) throw new Error(`This script belongs to a different spreadsheet (“${j.name}”). Add it to the sheet you opened here.`);
-      setSaveUrl(f.gsheet, url); f.title = j.name;
-      $('#gsOk').textContent = `Connected to “${j.name}”.`; $('#gsShare').hidden = false;
+      store.set('qv-save-url', url); store.set('qv-save-key', key); f.title = j.name;
+      $('#gsOk').textContent = `Connected — saving to “${j.name}”${j.kind === 'xlsx' ? ' (an .xlsx file; saving takes a few seconds)' : ''}.`; $('#gsShare').hidden = false;
       if (thenSave) { d.close(); saveToGoogle(); }
-    } catch (e) { $('#gsErr').textContent = e.message; }
-    finally { $('#gsConnect').disabled = false; $('#gsConnect').textContent = 'Connect'; }
+    } catch (e) {
+      $('#gsErr').textContent = /not found|no item|access/i.test(e.message) && !/key/.test(e.message)
+        ? `The script could not open this file (${e.message}). Make sure the account you deployed the script with can edit it.` : e.message;
+    } finally { $('#gsConnect').disabled = false; $('#gsConnect').textContent = 'Connect'; }
   };
 }
 
 async function saveToGoogle(force = false) {
   const f = state.files.find(x => x.gsheet); if (!f) return;
-  const url = getSaveUrl(f.gsheet);
+  const {url, key} = getConn();
   if (!url) { openGoogleSetup(true); return; }
   const items = [...pending.entries()].filter(([, e]) => e.sh.file === f);
   if (!items.length) { toast('Nothing to save'); return; }
   const btn = $('#cbSave'); btn.disabled = true; btn.textContent = 'Saving…';
   try {
-    const j = await callScript(url, {id: f.gsheet, force, changes: items.map(([, e]) =>
+    const j = await callScript(url, {key, id: f.gsheet, force, changes: items.map(([, e]) =>
       ({sheet: e.sh.name, tab: f.wb.SheetNames.indexOf(e.sh.name), row: e.r + 1, col: e.c + 1, old: e.old, value: e.value}))});
+    if (j.badKey) throw new Error('The save key does not match the script. Connect again.');
     if (!j.ok) throw new Error(j.error || 'Saving failed.');
     if (j.name) f.title = j.name;
     const conflicts = [], errors = [];
@@ -1008,12 +1064,12 @@ async function saveToGoogle(force = false) {
     if (conflicts.length || errors.length) showSaveProblems(conflicts, errors);
   } catch (e) {
     toast(e.message, true);
-    if (/answer correctly|reach/.test(e.message)) openGoogleSetup(true);
+    if (/answer correctly|reach|key/.test(e.message)) openGoogleSetup(true);
   } finally { btn.disabled = false; btn.textContent = 'Save to Google Sheet'; }
 }
 function showSaveProblems(conflicts, errors) {
   dialog(`<h3>Some changes were not saved</h3>` +
-    (conflicts.length ? `<p>These cells were changed in the Google Sheet by someone else since you opened it, so they were left alone:</p><div class="rv">${conflicts.map(({e, current}) =>
+    (conflicts.length ? `<p>These cells were changed in the file by someone else since you opened it, so they were left alone:</p><div class="rv">${conflicts.map(({e, current}) =>
       `<div class="rv-item"><div class="rv-h"><b>${esc(e.row.question_label || '')}</b><span class="muted">${esc(e.sh.name)} · row ${e.r + 1} · ${esc(e.field)}</span></div>` +
       `<div class="rv-diff"><div><i>Now in the sheet</i><pre>${esc(current)}</pre></div><div><i>Your version</i><pre>${esc(e.value)}</pre></div></div></div>`).join('')}</div>` : '') +
     (errors.length ? `<ul class="err">${errors.map(x => `<li>${esc(x)}</li>`).join('')}</ul>` : '') +
@@ -1021,12 +1077,12 @@ function showSaveProblems(conflicts, errors) {
   if ($('#spForce')) $('#spForce').onclick = () => { $('#dlg').close(); saveToGoogle(true); };
 }
 
-// open "#sheet=<id>&save=<url>" links (shared from the Google setup dialog)
+// open "#sheet=<id>&save=<url>&key=<key>" links (shared from the Google setup dialog)
 (() => {
   const h = new URLSearchParams(location.hash.slice(1));
-  const id = h.get('sheet'), save = h.get('save');
+  const id = h.get('sheet'), save = h.get('save'), key = h.get('key');
   if (!id || !/^[\w-]{20,}$/.test(id)) return;
-  if (save && isScriptUrl(save)) setSaveUrl(id, save);
+  if (save && isScriptUrl(save) && key) { store.set('qv-save-url', save); store.set('qv-save-key', key); }
   loadLink('https://docs.google.com/spreadsheets/d/' + id + '/edit');
 })();
 // image fallbacks (Drive links etc.)
@@ -1047,5 +1103,5 @@ const setTb = () => document.documentElement.style.setProperty('--tb', $('.topba
 new ResizeObserver(setTb).observe($('.topbar')); setTb();
 
 // expose for testing
-window.QV = {parseSheets, buildModel, rich, answerHTML, loadFiles, state, pending, setField, APPS_SCRIPT};
+window.QV = {parseSheets, buildModel, rich, answerHTML, loadFiles, state, pending, setField, scriptText};
 })();

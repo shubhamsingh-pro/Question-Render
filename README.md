@@ -32,12 +32,13 @@ Edited fields get an amber edge; the bar at the bottom lists unsaved changes, wi
 - **Download edited file** (or **⬇ Download** at the top) saves the workbook with your changes, in the same
   format it was opened in (.xlsx / .ods / .csv). Every tab and every other cell is kept; cell colours and
   formatting are not.
-- **Save to Google Sheet** (when the sheet was opened from a link) writes the changed cells straight into the sheet.
-  This needs a one-time setup by someone who can edit the sheet: the viewer shows a small Apps Script to paste
-  into *Extensions → Apps Script* and deploy as a *Web app* (Execute as: Me, Who has access: Anyone). Paste the
-  `/exec` URL back into the viewer. A cell that someone else changed in the meantime is not overwritten unless you
-  confirm it. **Copy link for colleagues** makes a link that opens the sheet with saving already connected —
-  anyone with that link can save to the sheet.
+- **Save to Google Sheet** (when the file was opened from a Google link) writes the changed cells straight back.
+  It works for native Google Sheets and for **.xlsx files stored in Google Drive** (the file stays .xlsx and keeps its link).
+  It needs a one-time setup per Google account: the viewer gives you a small Apps Script to paste into a new project at
+  script.google.com and deploy as a *Web app* (Execute as: Me, Who has access: Anyone); paste the `/exec` URL back
+  into the viewer. One deployment covers every file that account can edit. A cell that someone else changed in the
+  meantime is not overwritten unless you confirm it. **Copy link for colleagues** makes a link that opens the file
+  with saving already connected — anyone with that link can save to it.
   If your Google Workspace admin does not allow *Anyone* access for web apps, use *Download* instead.
 
 ## Run locally
