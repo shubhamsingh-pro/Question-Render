@@ -22,6 +22,24 @@ Everything runs in the browser — uploaded files never leave your computer.
 - A **data checks** panel lists broken links, missing questions, malformed group rows, weightage ≠ marks,
   MCQs with no correct option and LaTeX errors.
 
+## Editing
+Tick **✎ Edit** in the toolbar, then click any question, option, answer, marking criterion, explanation or concept
+detail to edit its source text (with a live KaTeX preview and buttons for maths, bold, sub/superscript, line breaks
+and images). Highlight a word on the page before clicking to jump straight to it in the editor.
+**All fields** on a card edits every column of that row (marks, difficulty, `correct_answer_n`, weightages, …).
+Edited fields get an amber edge; the bar at the bottom lists unsaved changes, with **Review** / **Undo**.
+
+- **Download edited file** (or **⬇ Download** at the top) saves the workbook with your changes, in the same
+  format it was opened in (.xlsx / .ods / .csv). Every tab and every other cell is kept; cell colours and
+  formatting are not.
+- **Save to Google Sheet** (when the sheet was opened from a link) writes the changed cells straight into the sheet.
+  This needs a one-time setup by someone who can edit the sheet: the viewer shows a small Apps Script to paste
+  into *Extensions → Apps Script* and deploy as a *Web app* (Execute as: Me, Who has access: Anyone). Paste the
+  `/exec` URL back into the viewer. A cell that someone else changed in the meantime is not overwritten unless you
+  confirm it. **Copy link for colleagues** makes a link that opens the sheet with saving already connected —
+  anyone with that link can save to the sheet.
+  If your Google Workspace admin does not allow *Anyone* access for web apps, use *Download* instead.
+
 ## Run locally
 Open `index.html` directly, or `python3 -m http.server` in this folder and visit http://localhost:8000.
 

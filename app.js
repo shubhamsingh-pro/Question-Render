@@ -138,10 +138,18 @@ function sheetKind(name, headers) {
   return name;
 }
 
-function parseSheets(wb, fileName) {
+/** Hidden (non-enumerable) bookkeeping on parsed rows, so it never shows up in search / raw views. */
+function hide(obj, props) { for (const [k, v] of Object.entries(props)) Object.defineProperty(obj, k, {value: v, writable: true, enumerable: false}); }
+let rowSeq = 0, sheetSeq = 0;
+
+/** file: {name, wb, ext, gsheet?}. Every row remembers its sheet and the cell each value came from, so edits can be written back. */
+function parseSheets(wb, file) {
   const out = [];
   for (const name of wb.SheetNames) {
-    const aoa = XLSX.utils.sheet_to_json(wb.Sheets[name], {header: 1, raw: false, defval: '', blankrows: false});
+    const ws = wb.Sheets[name];
+    if (!ws || !ws['!ref']) continue;
+    const range = XLSX.utils.decode_range(ws['!ref']);
+    const aoa = XLSX.utils.sheet_to_json(ws, {header: 1, raw: false, defval: '', blankrows: true});
     let hIdx = -1;
     for (let i = 0; i < Math.min(8, aoa.length); i++) {
       const cells = aoa[i].map(c => str(c).toLowerCase());
@@ -149,17 +157,22 @@ function parseSheets(wb, fileName) {
     }
     if (hIdx < 0) continue;
     const headers = aoa[hIdx].map(c => str(c).toLowerCase());
-    const rows = [];
+    const sh = {uid: sheetSeq++, name, file, kind: sheetKind(name, headers), headers, rows: [], r0: range.s.r, c0: range.s.c, colOf: {}};
+    headers.forEach((h, i) => { if (h && !(h in sh.colOf)) sh.colOf[h] = i; });
     for (let r = hIdx + 1; r < aoa.length; r++) {
-      const row = {}; let any = false;
+      const row = {}, col = {}; let any = false;
       headers.forEach((h, i) => {
         if (!h) return;
-        const v = aoa[r][i];
-        if (v !== '' && v != null && !(h in row && row[h] !== '')) { row[h] = v; any = true; }
+        const v = (aoa[r] || [])[i];
+        if (v !== '' && v != null && !(h in row)) { row[h] = v; col[h] = i; any = true; }
       });
-      if (any) { row.__row = r + 1; rows.push(row); }
+      if (!any) continue;
+      row.__row = range.s.r + r + 1;
+      hide(row, {__sheet: sh, __r: r, __col: col, __id: rowSeq++});
+      state.rowById.set(row.__id, row);
+      sh.rows.push(row);
     }
-    out.push({name, file: fileName, kind: sheetKind(name, headers), headers, rows});
+    out.push(sh);
   }
   return out;
 }
@@ -169,20 +182,21 @@ function buildModel(sheets) {
   const chapters = new Map(), topics = new Map(), concepts = new Map(), groups = new Map();
   const questions = [], issues = [];
   const seq = {c: 0};
-  const merge = (map, key, row, extra) => {
+  const merge = (map, key, src, re, extra) => {
+    const row = pick(src, re);
     const cur = map.get(key);
-    if (!cur) { map.set(key, Object.assign({key, order: seq.c++, row}, extra)); return; }
-    for (const [k, v] of Object.entries(row)) if (str(v) && !str(cur.row[k])) cur.row[k] = v;
+    if (!cur) { map.set(key, Object.assign({key, order: seq.c++, row, src: Object.fromEntries(Object.keys(row).map(k => [k, src]))}, extra)); return; }
+    for (const [k, v] of Object.entries(row)) if (str(v) && !str(cur.row[k])) { cur.row[k] = v; cur.src[k] = src; }
   };
 
   for (const sh of sheets) for (const row of sh.rows) {
     const ctx = {sheet: sh.name, kind: sh.kind, rowNo: row.__row};
-    if (str(row.chapter_title)) merge(chapters, chapterKey(row.chapter_title), pick(row, /^(chapter_|is_update_chapter|pre_topics|post_topics)/), {title: str(row.chapter_title)});
-    if (str(row.topic_title)) merge(topics, codeOf(row.topic_title), pick(row, /^(topic_|is_update_topic|pre_post_learning|related_topics)/), {title: str(row.topic_title)});
-    if (str(row.concept_title)) merge(concepts, codeOf(row.concept_title), pick(row, /^(concept_|is_update_concept|keywords|digicards|related_concepts|basic_groups|intermediate_groups|advanced_groups)/), {title: str(row.concept_title)});
+    if (str(row.chapter_title)) merge(chapters, chapterKey(row.chapter_title), row, /^(chapter_|is_update_chapter|pre_topics|post_topics)/, {title: str(row.chapter_title)});
+    if (str(row.topic_title)) merge(topics, codeOf(row.topic_title), row, /^(topic_|is_update_topic|pre_post_learning|related_topics)/, {title: str(row.topic_title)});
+    if (str(row.concept_title)) merge(concepts, codeOf(row.concept_title), row, /^(concept_|is_update_concept|keywords|digicards|related_concepts|basic_groups|intermediate_groups|advanced_groups)/, {title: str(row.concept_title)});
     if (str(row.group_name) && !/^\([^()]+\)\s*\S+/.test(str(row.group_name)))
       issues.push({type: 'Malformed group row', text: `${sh.name} row ${row.__row}: group_name is "${str(row.group_name).slice(0, 80)}" — expected "(CONCEPT_CODE) BG01". The group columns in this row look shifted.`});
-    else if (str(row.group_name)) merge(groups, groupKey(row.group_name), pick(row, /^(group_|is_update_group|related_digicards)/), {title: str(row.group_name)});
+    else if (str(row.group_name)) merge(groups, groupKey(row.group_name), row, /^(group_|is_update_group|related_digicards)/, {title: str(row.group_name)});
     if (str(row.question_label)) {
       questions.push({
         label: str(row.question_label), key: qkey(row.question_label), kind: sh.kind, sheet: sh.name, rowNo: row.__row, row,
@@ -311,7 +325,52 @@ function criteria(r, typeKey, wKey, cKey, max = 40) {
 }
 
 /* ---------------- state + rendering ---------------- */
-const state = {model: null, sheets: [], files: [], sel: null, q: '', fType: '', fCat: '', fDiff: '', fGroupType: '', limit: 60};
+const state = {model: null, sheets: [], files: [], rowById: new Map(), sel: null, q: '', fType: '', fCat: '', fDiff: '', fGroupType: '', limit: 60};
+
+/* ---------------- editing: pending cell changes ---------------- */
+const pending = new Map(); // cellKey -> {row, field, sh, r, c, old, value}
+function cellRef(row, field) {
+  const sh = row.__sheet, ci = row.__col[field] ?? sh.colOf[field];
+  if (ci == null) return null;
+  const r = sh.r0 + row.__r, c = sh.c0 + ci;
+  return {sh, ci, r, c, key: `${sh.uid}|${r}|${c}`};
+}
+/** Attributes that make a rendered block editable. kind: rich | q (question, with blanks) | ans (answer, uses typeField) */
+function edA(row, field, kind = 'rich', typeField = '', also = '') {
+  if (!row || !row.__sheet) return '';
+  const p = pending.get(cellRef(row, field)?.key);
+  return ` data-ed="${row.__id}|${esc(field)}|${kind}|${esc(typeField)}|${esc(also)}"` + (p ? ` data-edited title="Edited — was: ${esc(p.old.slice(0, 300))}"` : '');
+}
+function writeCell(sh, r, c, value) {
+  const ws = sh.file.wb.Sheets[sh.name], addr = XLSX.utils.encode_cell({r, c}), cur = ws[addr];
+  if (value === '') { delete ws[addr]; return; }
+  ws[addr] = cur && cur.t === 'n' && /^-?\d+(\.\d+)?$/.test(value.trim()) ? {t: 'n', v: +value} : {t: 's', v: value};
+}
+/** Change one value of a row: updates the row, the workbook (for download) and the pending list (for Google save). */
+function setField(row, field, value) {
+  value = String(value ?? '').replace(/\r\n?/g, '\n');
+  const ref = cellRef(row, field);
+  if (!ref) return false;
+  const now = row[field] == null ? '' : String(row[field]);
+  if (value === now) return false;
+  const prev = pending.get(ref.key), old = prev ? prev.old : now;
+  if (value === old) pending.delete(ref.key);
+  else pending.set(ref.key, {row, field, sh: ref.sh, r: ref.r, c: ref.c, old, value});
+  row[field] = value; row.__col[field] = ref.ci;
+  writeCell(ref.sh, ref.r, ref.c, value);
+  ref.sh.file.dirty = true;
+  return true;
+}
+function blanksOf(r) {
+  const blanks = {};
+  for (let n = 1; n <= 40; n++) if (str(r['placeholder_' + n])) blanks[str(r['placeholder_' + n]).toUpperCase()] = r['answer_' + n];
+  return blanks;
+}
+function renderField(kind, row, value, typeField) {
+  if (kind === 'q') return rich(value, {blanks: blanksOf(row)});
+  if (kind === 'ans') return answerHTML(value, row[typeField]);
+  return rich(value);
+}
 
 function label(map, key, field) {
   const e = map.get(key);
@@ -394,7 +453,8 @@ function cardHTML(q, idx) {
   const g = M.groups.get(q.group);
   const diff = str(r.level_of_difficulty);
   let h = `<article class="card" id="q-${esc(q.key)}"><div class="card-h">` +
-    `<span class="qno">Q${idx + 1}</span><span class="qlabel" title="Click to copy">${esc(q.label)}</span><span class="spacer"></span>` +
+    `<span class="qno">Q${idx + 1}</span><span class="qlabel" title="Click to copy">${esc(q.label)}</span>` +
+    `<button class="btn ghost tiny edit-only" type="button" data-allfields="${r.__id}">✎ All fields</button><span class="spacer"></span>` +
     `<span class="badge type">${esc(q.kind)}</span>` +
     (str(r.question_category) ? `<span class="badge">${esc(r.question_category)}</span>` : '') +
     (diff ? `<span class="badge ${esc(diff)}">${esc(diff)}</span>` : '') +
@@ -408,49 +468,50 @@ function cardHTML(q, idx) {
     `</div><div class="card-b">`;
 
   // blanks map for $$a$$ placeholders
-  const blanks = {};
-  for (let n = 1; n <= 40; n++) if (str(r['placeholder_' + n])) blanks[str(r['placeholder_' + n]).toUpperCase()] = r['answer_' + n];
+  const blanks = blanksOf(r);
 
   const qStem = str(r.question), qText = str(r.question_text);
   if (qStem && qText && qStem !== qText) {
-    h += blk('Question', `<div class="rich qtext">${rich(qStem, {blanks})}</div>`);
-    h += blk('Question text', `<div class="rich qtext">${rich(qText, {blanks})}</div>`);
+    h += blk('Question', `<div class="rich qtext"${edA(r, 'question', 'q')}>${rich(qStem, {blanks})}</div>`);
+    h += blk('Question text', `<div class="rich qtext"${edA(r, 'question_text', 'q')}>${rich(qText, {blanks})}</div>`);
   } else if (qStem || qText) {
-    h += blk('Question', `<div class="rich qtext">${rich(qStem || qText, {blanks})}</div>`);
+    // both columns hold the same text: editing it updates both
+    const f = qStem ? 'question' : 'question_text', also = qStem && qText ? 'question_text' : '';
+    h += blk('Question', `<div class="rich qtext"${edA(r, f, 'q', '', also)}>${rich(qStem || qText, {blanks})}</div>`);
   }
-  if (str(r.question_disclaimer)) h += blk('Disclaimer', `<div class="rich">${rich(r.question_disclaimer)}</div>`);
+  if (str(r.question_disclaimer)) h += blk('Disclaimer', `<div class="rich"${edA(r, 'question_disclaimer')}>${rich(r.question_disclaimer)}</div>`);
 
   if (q.kind === 'Objective') {
     const opts = options(r);
     if (opts.length) h += blk('Options', `<ul class="opts">${opts.map((o, i) =>
-      `<li class="${o.correct ? 'correct' : ''}"><span class="ol">${String.fromCharCode(97 + i)})</span><span class="rich">${answerHTML(o.content, o.type)}</span><span class="w">${esc(o.type)}${o.w !== '' ? ' · wt ' + fmtNum(o.w) : ''}</span></li>`).join('')}</ul>`);
+      `<li class="${o.correct ? 'correct' : ''}"><span class="ol">${String.fromCharCode(97 + i)})</span><span class="rich"${edA(r, 'answer_content_' + o.n, 'ans', 'answer_type_' + o.n)}>${answerHTML(o.content, o.type)}</span><span class="w">${esc(o.type)}${o.w !== '' ? ' · wt ' + fmtNum(o.w) : ''}</span></li>`).join('')}</ul>`);
   }
 
-  if (str(r.display_answer)) h += blk('Answer to display', `<div class="rich ans">${rich(r.display_answer)}</div>`, 'ans-only');
+  if (str(r.display_answer)) h += blk('Answer to display', `<div class="rich ans"${edA(r, 'display_answer')}>${rich(r.display_answer)}</div>`, 'ans-only');
 
   if (q.kind === 'Descriptive') {
     const cr = criteria(r, 'answer_type_', 'answer_weightage_', 'answer_content_');
-    if (cr.length) h += blk('Marking criteria', critTable(cr), 'mark-only');
+    if (cr.length) h += blk('Marking criteria', critTable(cr, r, 'answer_content_', 'answer_type_'), 'mark-only');
     for (let s = 1; s <= 15; s++) {
       if (!str(r['sub_question_' + s])) continue;
       const sc = criteria(r, `sq${s}_answer_type_`, `sq${s}_weightage_`, `sq${s}_keyword_`);
       h += `<div class="subq"><div class="subq-h"><b>Sub-question ${s}</b>${str(r['sub_question_marks_' + s]) ? `<span class="badge">${fmtNum(r['sub_question_marks_' + s])} marks</span>` : ''}</div>` +
-           `<div class="rich">${rich(r['sub_question_' + s])}</div>` +
-           (sc.length ? `<div class="mark-only" style="margin-top:8px">${critTable(sc)}</div>` : '') + `</div>`;
+           `<div class="rich"${edA(r, 'sub_question_' + s)}>${rich(r['sub_question_' + s])}</div>` +
+           (sc.length ? `<div class="mark-only" style="margin-top:8px">${critTable(sc, r, `sq${s}_keyword_`, `sq${s}_answer_type_`)}</div>` : '') + `</div>`;
     }
   }
   if (q.kind === 'Subjective') {
     const acc = [];
     for (let n = 1; n <= 40; n++) if (str(r['answer_' + n])) acc.push({n, type: str(r['answer_type_' + n]), w: str(r['weightage_' + n]), content: r['answer_' + n], ph: str(r['placeholder_' + n]), disp: str(r['answer_display_' + n])});
     if (acc.length) h += blk('Accepted answers', `<table class="mk"><thead><tr><th>Blank</th><th>Answer</th><th>Type</th><th>Weightage</th><th>Display</th></tr></thead><tbody>${acc.map(a =>
-      `<tr><td class="n">${esc(a.ph || a.n)}</td><td class="rich">${answerHTML(a.content, a.type)}</td><td class="n">${esc(a.type)}</td><td class="n">${fmtNum(a.w)}</td><td class="n">${esc(a.disp)}</td></tr>`).join('')}</tbody></table>`, 'ans-only');
+      `<tr><td class="n">${esc(a.ph || a.n)}</td><td class="rich"${edA(r, 'answer_' + a.n, 'ans', 'answer_type_' + a.n)}>${answerHTML(a.content, a.type)}</td><td class="n">${esc(a.type)}</td><td class="n">${fmtNum(a.w)}</td><td class="n">${esc(a.disp)}</td></tr>`).join('')}</tbody></table>`, 'ans-only');
   }
   if (q.kind !== 'Objective' && q.kind !== 'Descriptive' && q.kind !== 'Subjective') {
     const cr = criteria(r, 'answer_type_', 'answer_weightage_', 'answer_content_');
-    if (cr.length) h += blk('Answers', critTable(cr), 'ans-only');
+    if (cr.length) h += blk('Answers', critTable(cr, r, 'answer_content_', 'answer_type_'), 'ans-only');
   }
   const expl = str(r.answer_explanation);
-  if (expl && expl !== str(r.display_answer)) h += blk('Answer explanation', `<div class="rich expl">${rich(expl)}</div>`, 'ans-only');
+  if (expl && expl !== str(r.display_answer)) h += blk('Answer explanation', `<div class="rich expl"${edA(r, 'answer_explanation')}>${rich(expl)}</div>`, 'ans-only');
 
   const meta = [['Cognitive skill', r.cognitive_skills], ['Source', r.question_source], ['Duration (min)', r.question_duration], ['Appears in', r.question_appears_in],
     ['Answer restriction', r.answer_restriction], ['Math keyboard', r.math_keyboard], ['Update?', r.is_update_question], ['Group description', g?.row.group_description],
@@ -461,9 +522,9 @@ function cardHTML(q, idx) {
   return h;
 }
 function blk(title, inner, cls = '') { return `<div class="blk ${cls}"><div class="lbl">${esc(title)}</div>${inner}</div>`; }
-function critTable(cr) {
+function critTable(cr, row, cKey, tKey) {
   return `<table class="mk"><thead><tr><th>#</th><th>Answer content</th><th>Answer type</th><th>Weightage</th></tr></thead><tbody>${cr.map(c =>
-    `<tr><td class="n">${c.n}</td><td class="rich">${answerHTML(c.content, c.type)}</td><td class="n">${esc(c.type)}</td><td class="n">${fmtNum(c.w)}</td></tr>`).join('')}</tbody></table>`;
+    `<tr><td class="n">${c.n}</td><td class="rich"${edA(row, cKey + c.n, 'ans', tKey + c.n)}>${answerHTML(c.content, c.type)}</td><td class="n">${esc(c.type)}</td><td class="n">${fmtNum(c.w)}</td></tr>`).join('')}</tbody></table>`;
 }
 
 function conceptHeader(q) {
@@ -473,7 +534,7 @@ function conceptHeader(q) {
   const kw = c && str(c.row.keywords);
   return `<div class="sec-h"><div class="crumbs">${esc(q.chapter ? label(M.chapters, q.chapter, 'chapter_display_name') : 'No chapter')} › ${esc(q.topic ? label(M.topics, q.topic, 'topic_display_name') : 'No topic')}</div>` +
     `<h3>${esc(q.concept ? label(M.concepts, q.concept, 'concept_display_name') : 'Questions not linked to a concept')}</h3>` +
-    (det || kw ? `<details><summary>Concept details</summary><div class="concept-body rich">${kw ? `<p><b>Keywords:</b> ${esc(kw)}</p>` : ''}${det ? rich(det) : ''}</div></details>` : '') + `</div>`;
+    (det || kw ? `<details><summary>Concept details</summary><div class="concept-body rich">${kw ? `<p><b>Keywords:</b> ${esc(kw)}</p>` : ''}${det ? `<div${edA(c.src.concept_details, 'concept_details')}>${rich(det)}</div>` : ''}</div></details>` : '') + `</div>`;
 }
 
 function renderList() {
@@ -511,9 +572,17 @@ function renderIssues() {
     uniq.map(i => `<li><b>${esc(i.type)}</b> — ${esc(i.text)}</li>`).join('') + `</ul></details>`;
 }
 
-function fillSelect(id, values, allLabel) {
+function fillSelect(id, values, allLabel, keep = '') {
   const sel = $(id);
   sel.innerHTML = `<option value="">${allLabel}</option>` + [...values].filter(Boolean).sort(natural).map(v => `<option>${esc(v)}</option>`).join('');
+  sel.value = keep;
+}
+function fillFilters() {
+  const Q = state.model.questions;
+  fillSelect('#fType', new Set(Q.map(q => q.kind)), 'All sheets', state.fType);
+  fillSelect('#fCat', new Set(Q.map(q => str(q.row.question_category))), 'All categories', state.fCat);
+  fillSelect('#fDiff', new Set(Q.map(q => str(q.row.level_of_difficulty))), 'All difficulty', state.fDiff);
+  fillSelect('#fGroupType', new Set([...state.model.groups.values()].map(g => g.type)), 'All group levels', state.fGroupType);
 }
 
 function applyToggles() {
@@ -522,6 +591,9 @@ function applyToggles() {
   L.classList.toggle('hide-mark', !$('#tMark').checked);
   L.classList.toggle('hide-meta', !$('#tMeta').checked);
   L.classList.toggle('hide-raw', !$('#tRaw').checked);
+  L.classList.toggle('editing', $('#tEdit').checked);
+  $('#editHint').hidden = !$('#tEdit').checked;
+  if (!$('#tEdit').checked) closeEditor();
 }
 
 function rerender(resetLimit = true) {
@@ -534,13 +606,16 @@ function rerender(resetLimit = true) {
 async function loadFiles(files) {
   showLoading(true);
   try {
-    const sheets = [];
+    const sheets = [], srcs = [];
+    resetSources();
     for (const f of files) {
       const buf = await f.arrayBuffer();
       const wb = XLSX.read(buf, {type: 'array', cellDates: false, cellFormula: false});
-      sheets.push(...parseSheets(wb, f.name));
+      const src = {name: f.name, wb, ext: (f.name.match(/\.(\w+)$/) || [, 'xlsx'])[1].toLowerCase()};
+      srcs.push(src);
+      sheets.push(...parseSheets(wb, src));
     }
-    start(sheets, files.map(f => f.name).join(', '));
+    start(sheets, files.map(f => f.name).join(', '), srcs);
   } catch (e) { fail(e); }
   finally { showLoading(false); }
 }
@@ -555,29 +630,30 @@ async function loadLink(url) {
     const head = new Uint8Array(buf.slice(0, 2));
     if (head[0] !== 0x50 || head[1] !== 0x4b) throw new Error('Google did not return a spreadsheet.');
     const wb = XLSX.read(buf, {type: 'array'});
-    start(parseSheets(wb, 'Google Sheet ' + id), 'Google Sheet ' + id);
+    resetSources();
+    const src = {name: 'Google Sheet ' + id, wb, ext: 'xlsx', gsheet: id};
+    start(parseSheets(wb, src), 'Google Sheet ' + id, [src]);
     try { history.replaceState(null, '', '#sheet=' + id); } catch (_) {}
   } catch (e) {
     fail(new Error(`${e.message}\nThe sheet could not be fetched directly. Either share it as "Anyone with the link – Viewer", or download it (File → Download → Microsoft Excel) and upload the file.`));
   } finally { showLoading(false); }
 }
-function start(sheets, name) {
+function resetSources() { state.rowById = new Map(); pending.clear(); }
+function start(sheets, name, srcs) {
   if (!sheets.length) throw new Error('No sheet with a question_label / chapter_title header row was found in this file.');
   state.sheets = sheets;
+  state.files = srcs;
   state.model = buildModel(sheets);
   state.sel = null;
   if (!state.model.questions.length) throw new Error('The file was read, but no question rows (question_label column) were found.');
   $('#fileInfo').textContent = `${name} — tabs: ${sheets.map(s => `${s.name} (${s.rows.length})`).join(', ')}`;
   document.title = name + ' · Question Bank Viewer';
-  const Q = state.model.questions;
-  fillSelect('#fType', new Set(Q.map(q => q.kind)), 'All sheets');
-  fillSelect('#fCat', new Set(Q.map(q => str(q.row.question_category))), 'All categories');
-  fillSelect('#fDiff', new Set(Q.map(q => str(q.row.level_of_difficulty))), 'All difficulty');
-  fillSelect('#fGroupType', new Set([...state.model.groups.values()].map(g => g.type)), 'All group levels');
   Object.assign(state, {q: '', fType: '', fCat: '', fDiff: '', fGroupType: ''});
+  fillFilters();
   $('#search').value = '';
   $('#landing').hidden = true; $('#viewer').hidden = false; $('#loadErr').textContent = '';
-  renderTree(); applyToggles(); rerender();
+  renderTree(); applyToggles(); rerender(); updateBar();
+  $('#dlBtn').hidden = false;
   window.scrollTo(0, 0);
 }
 function fail(e) {
@@ -611,7 +687,7 @@ let searchT;
 $('#search').addEventListener('input', e => { clearTimeout(searchT); searchT = setTimeout(() => { state.q = e.target.value.trim(); rerender(); }, 180); });
 [['#fType', 'fType'], ['#fCat', 'fCat'], ['#fDiff', 'fDiff'], ['#fGroupType', 'fGroupType']].forEach(([id, k]) =>
   $(id).addEventListener('change', e => { state[k] = e.target.value; rerender(); }));
-['#tAns', '#tMark', '#tMeta', '#tRaw'].forEach(id => $(id).addEventListener('change', applyToggles));
+['#tAns', '#tMark', '#tMeta', '#tRaw', '#tEdit'].forEach(id => $(id).addEventListener('change', applyToggles));
 
 function select(lvl, key) {
   state.sel = (state.sel && state.sel.lvl === lvl && state.sel.key === key) ? null : {lvl, key};
@@ -626,6 +702,7 @@ $('#tree').addEventListener('click', e => {
 });
 $('#clearTree').addEventListener('click', () => { state.sel = null; renderTree(); rerender(); });
 document.addEventListener('click', e => {
+  if (editClick(e)) return;
   const c = e.target.closest('.chip');
   if (c) { select(c.dataset.lvl, c.dataset.key); return; }
   if (e.target.id === 'clearSel') { state.sel = null; renderTree(); rerender(); return; }
@@ -637,6 +714,321 @@ document.addEventListener('click', e => {
   if (e.target.closest('#lightbox')) $('#lightbox').hidden = true;
 });
 document.addEventListener('keydown', e => { if (e.key === 'Escape') $('#lightbox').hidden = true; });
+
+/* ---------------- editing UI ---------------- */
+let openEd = null; // {el, html}
+function closeEditor() {
+  if (!openEd) return;
+  openEd.el.innerHTML = openEd.html; openEd.el.classList.remove('ed-open');
+  openEd = null;
+}
+/** Re-run linking + rendering after an edit, keeping filters, selection and how many cards are shown. */
+function refresh() {
+  openEd = null;
+  state.model = buildModel(state.sheets);
+  fillFilters(); renderTree();
+  katexIssues = []; renderList(); updateBar();
+}
+function previewHTML(kind, row, value, typeField) {
+  const saved = katexIssues; katexIssues = [];
+  try { return renderField(kind, row, value, typeField) || '<span class="muted">(empty)</span>'; } finally { katexIssues = saved; }
+}
+function openEditor(el) {
+  const picked = String(getSelection() || '').trim();
+  closeEditor();
+  const [id, field, kind, typeField, also] = el.dataset.ed.split('|');
+  const row = state.rowById.get(+id); if (!row) return;
+  const value = row[field] == null ? '' : String(row[field]);
+  const p = pending.get(cellRef(row, field)?.key);
+  openEd = {el, html: el.innerHTML};
+  el.classList.add('ed-open');
+  el.innerHTML = `<div class="editor">` +
+    `<div class="ed-head"><b>${esc(field)}</b><span>${esc(row.question_label || '')} · ${esc(row.__sheet.name)} row ${row.__row}${also ? ` · also updates ${esc(also)}` : ''}</span></div>` +
+    `<div class="ed-tools"><button type="button" data-ins="katex" title="Wrap the highlighted text as maths">∑ Maths</button><button type="button" data-ins="b"><b>B</b></button><button type="button" data-ins="i"><i>I</i></button>` +
+    `<button type="button" data-ins="sub">x<sub>2</sub></button><button type="button" data-ins="sup">x<sup>2</sup></button><button type="button" data-ins="br">↵ Line break</button><button type="button" data-ins="img">Image</button></div>` +
+    `<textarea spellcheck="true"></textarea>` +
+    `<div class="lbl">Preview</div><div class="ed-prev rich"></div>` +
+    `<div class="ed-act"><button class="btn" type="button" data-act="save">Save</button><button class="btn ghost" type="button" data-act="cancel">Cancel</button>` +
+    (p ? `<button class="btn ghost" type="button" data-act="revert" title="${esc(p.old.slice(0, 300))}">Undo my change</button>` : '') +
+    `<span class="hint">Ctrl+Enter save · Esc cancel</span></div></div>`;
+  const ta = el.querySelector('textarea'), prev = el.querySelector('.ed-prev');
+  const fit = () => { ta.style.height = 'auto'; ta.style.height = Math.min(420, ta.scrollHeight + 4) + 'px'; };
+  const upd = () => { prev.innerHTML = previewHTML(kind, row, ta.value, typeField); fit(); };
+  ta.value = value; upd();
+  ta.focus();
+  const at = picked ? value.indexOf(picked) : -1; // highlight what was selected on the page, if found in the source
+  if (at >= 0) ta.setSelectionRange(at, at + picked.length); else ta.setSelectionRange(value.length, value.length);
+  ta.addEventListener('input', upd);
+  ta.addEventListener('keydown', e => {
+    if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); closeEditor(); }
+    if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); save(ta.value); }
+  });
+  const save = v => {
+    const changed = [setField(row, field, v), also ? setField(row, also, v) : false].some(Boolean);
+    if (changed) refresh(); else closeEditor();
+  };
+  el.querySelector('.editor').addEventListener('click', e => {
+    const b = e.target.closest('button'); if (!b) return;
+    if (b.dataset.act === 'save') save(ta.value);
+    else if (b.dataset.act === 'cancel') closeEditor();
+    else if (b.dataset.act === 'revert') save(p.old);
+    else if (b.dataset.ins) { insert(ta, b.dataset.ins); upd(); }
+  });
+}
+function insert(ta, what) {
+  const a = ta.selectionStart, b = ta.selectionEnd, sel = ta.value.slice(a, b);
+  const wrap = {katex: ['[Katex]', '[/Katex]', 'x^2'], b: ['<b>', '</b>', 'text'], i: ['<i>', '</i>', 'text'], sub: ['<sub>', '</sub>', '2'], sup: ['<sup>', '</sup>', '2'],
+    br: ['<br>', '', ''], img: ['[img src="', '" alt=""]', 'https://']}[what];
+  const inner = what === 'br' ? '' : (sel || wrap[2]);
+  ta.setRangeText(wrap[0] + inner + wrap[1], a, b, 'end');
+  if (!sel && inner) ta.setSelectionRange(a + wrap[0].length, a + wrap[0].length + inner.length);
+  ta.focus();
+}
+function editClick(e) {
+  if (e.target.closest('.editor')) return true;
+  const af = e.target.closest('[data-allfields]');
+  if (af) { openAllFields(state.rowById.get(+af.dataset.allfields)); return true; }
+  if (!$('#list').classList.contains('editing')) return false;
+  const el = e.target.closest('[data-ed]');
+  if (!el || !$('#list').contains(el)) return false;
+  e.preventDefault();
+  openEditor(el);
+  return true;
+}
+
+/* ---------------- dialogs ---------------- */
+function dialog(html, cls = '') {
+  const d = $('#dlg');
+  d.className = cls; d.onclick = null; d.innerHTML = `<button class="dlg-x" type="button" data-close aria-label="Close">×</button>` + html;
+  if (!d.open) d.showModal();
+  return d;
+}
+$('#dlg').addEventListener('click', e => { if (e.target.closest('[data-close]') || e.target === $('#dlg')) $('#dlg').close(); });
+
+function openAllFields(row) {
+  if (!row) return;
+  const sh = row.__sheet, heads = [...new Set(sh.headers.filter(Boolean))];
+  const d = dialog(`<h3>Edit all fields</h3><p class="muted">${esc(row.question_label || '')} · ${esc(sh.name)} row ${row.__row}</p>` +
+    `<div class="af-tools"><input type="search" id="afFilter" placeholder="Filter fields…"><label><input type="checkbox" id="afEmpty"> Show empty fields</label></div>` +
+    `<form id="afForm" class="af">${heads.map(h => {
+      const v = row[h] == null ? '' : String(row[h]);
+      return `<label class="af-row${v ? '' : ' empty'}${isEditedField(row, h) ? ' edited' : ''}" data-h="${esc(h)}"><span>${esc(h)}</span><textarea name="${esc(h)}" rows="${Math.min(8, Math.max(1, Math.ceil(v.length / 70), v.split('\n').length))}">${esc(v)}</textarea></label>`;
+    }).join('')}</form>` +
+    `<div class="dlg-act"><button class="btn" type="button" id="afSave">Save changes</button><button class="btn ghost" type="button" data-close>Cancel</button></div>`, 'wide');
+  const apply = () => {
+    const term = $('#afFilter').value.trim().toLowerCase(), showEmpty = $('#afEmpty').checked;
+    d.querySelectorAll('.af-row').forEach(l => l.hidden = (!showEmpty && l.classList.contains('empty')) || (term && !l.dataset.h.includes(term)));
+  };
+  $('#afFilter').addEventListener('input', apply); $('#afEmpty').addEventListener('change', apply); apply();
+  $('#afSave').addEventListener('click', () => {
+    let n = 0;
+    d.querySelectorAll('#afForm textarea').forEach(t => { const now = row[t.name] == null ? '' : String(row[t.name]); if (t.value !== now && setField(row, t.name, t.value)) n++; });
+    d.close();
+    if (n) { refresh(); toast(`${n} field${n > 1 ? 's' : ''} updated`); }
+  });
+}
+function isEditedField(row, field) { const ref = cellRef(row, field); return !!(ref && pending.has(ref.key)); }
+
+function openReview() {
+  const items = [...pending.entries()];
+  if (!items.length) { toast('No unsaved changes'); return; }
+  const d = dialog(`<h3>${items.length} unsaved change${items.length > 1 ? 's' : ''}</h3><div class="rv">${items.map(([k, e]) =>
+    `<div class="rv-item"><div class="rv-h"><b>${esc(e.row.question_label || e.row.concept_title || '')}</b><span class="muted">${esc(e.sh.name)} · row ${e.r + 1} · ${esc(e.field)}</span>` +
+    `<button class="btn ghost tiny" type="button" data-undo="${esc(k)}">Undo</button></div>` +
+    `<div class="rv-diff"><div><i>Before</i><pre>${esc(e.old) || '<span class="muted">(empty)</span>'}</pre></div><div><i>After</i><pre>${esc(e.value) || '<span class="muted">(empty)</span>'}</pre></div></div></div>`).join('')}</div>` +
+    `<div class="dlg-act">${hasGsheet() ? `<button class="btn" type="button" data-act="gsave">Save to Google Sheet</button>` : ''}<button class="btn${hasGsheet() ? ' ghost' : ''}" type="button" data-act="dl">Download edited file</button><button class="btn ghost" type="button" data-act="undoall">Undo all</button></div>`, 'wide');
+  d.querySelector('.rv').parentElement.onclick = e => {
+    const u = e.target.closest('[data-undo]'), a = e.target.closest('[data-act]');
+    if (u) { const p = pending.get(u.dataset.undo); if (p) setField(p.row, p.field, p.old); refresh(); openReview(); if (!pending.size) d.close(); }
+    else if (a?.dataset.act === 'undoall') { if (confirm('Undo every unsaved change?')) { [...pending.values()].forEach(p => setField(p.row, p.field, p.old)); refresh(); d.close(); } }
+    else if (a?.dataset.act === 'dl') { d.close(); download(); }
+    else if (a?.dataset.act === 'gsave') { d.close(); saveToGoogle(); }
+  };
+}
+
+/* ---------------- change bar, download ---------------- */
+const hasGsheet = () => state.files.some(f => f.gsheet);
+function updateBar() {
+  const n = pending.size, bar = $('#changeBar');
+  bar.hidden = !n;
+  document.body.classList.toggle('has-bar', !!n);
+  if (!n) return;
+  $('#cbText').textContent = `${n} unsaved change${n > 1 ? 's' : ''}`;
+  $('#cbSave').hidden = !hasGsheet();
+  $('#cbDl').classList.toggle('ghost', hasGsheet());
+}
+function download() {
+  const list = state.files.filter(f => f.dirty);
+  for (const f of (list.length ? list : state.files)) {
+    const ext = f.ext, bookType = {ods: 'ods', csv: 'csv', tsv: 'csv'}[ext] || 'xlsx';
+    const outExt = ext === 'tsv' ? 'tsv' : bookType;
+    const base = (f.title || f.name).replace(/\.[^.]+$/, '').replace(/[\\/:*?"<>|]+/g, ' ').trim();
+    XLSX.writeFile(f.wb, `${base}${f.dirty ? ' (edited)' : ''}.${outExt}`, {bookType, ...(ext === 'tsv' ? {FS: '\t'} : {})});
+    if (!f.gsheet) for (const [k, e] of pending) if (e.sh.file === f) pending.delete(k); // now saved in the downloaded file
+  }
+  refresh();
+}
+function toast(msg, bad = false) {
+  const t = $('#toast');
+  t.textContent = msg; t.className = 'toast' + (bad ? ' bad' : ''); t.hidden = false;
+  clearTimeout(toast.t); toast.t = setTimeout(() => t.hidden = true, bad ? 9000 : 3500);
+}
+$('#cbReview').addEventListener('click', openReview);
+$('#cbDl').addEventListener('click', download);
+$('#dlBtn').addEventListener('click', download);
+$('#cbSave').addEventListener('click', () => saveToGoogle());
+window.addEventListener('beforeunload', e => { if (pending.size) { e.preventDefault(); e.returnValue = ''; } });
+
+/* ---------------- save back to Google Sheets (via a small Apps Script web app in the sheet) ---------------- */
+const APPS_SCRIPT = `/**
+ * Question Bank Viewer – save-back script.
+ * Lets the viewer write edited cells back into THIS spreadsheet.
+ * Setup: Extensions → Apps Script → paste this → Deploy → New deployment →
+ *        type "Web app", Execute as "Me", Who has access "Anyone" → Deploy → copy the Web app URL.
+ */
+function doGet() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  return json_({ok: true, id: ss.getId(), name: ss.getName()});
+}
+
+function doPost(e) {
+  var lock = LockService.getDocumentLock();
+  lock.waitLock(30000);
+  try {
+    var req = JSON.parse(e.postData.contents);
+    var ss = SpreadsheetApp.getActiveSpreadsheet();
+    if (req.id && req.id !== ss.getId()) {
+      return json_({ok: false, error: 'This save link belongs to a different spreadsheet ("' + ss.getName() + '").'});
+    }
+    var results = (req.changes || []).map(function (c) {
+      var sh = ss.getSheetByName(c.sheet) || ss.getSheets()[c.tab];
+      if (!sh) return {ok: false, error: 'Tab "' + c.sheet + '" not found'};
+      var cell = sh.getRange(c.row, c.col);
+      var shown = String(cell.getDisplayValue()), raw = String(cell.getValue());
+      if (!req.force && norm_(shown) !== norm_(c.old) && norm_(raw) !== norm_(c.old)) {
+        return {ok: false, conflict: true, current: shown};
+      }
+      var v = String(c.value);
+      cell.setValue(/^[=+@]/.test(v) ? "'" + v : v);
+      return {ok: true};
+    });
+    SpreadsheetApp.flush();
+    return json_({ok: true, name: ss.getName(), results: results});
+  } catch (err) {
+    return json_({ok: false, error: String(err)});
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function norm_(s) { return String(s == null ? '' : s).replace(/\\s+/g, ' ').trim(); }
+function json_(o) { return ContentService.createTextOutput(JSON.stringify(o)).setMimeType(ContentService.MimeType.JSON); }
+`;
+const saveUrlKey = id => 'qv-save-' + id;
+function getSaveUrl(id) { try { return localStorage.getItem(saveUrlKey(id)) || ''; } catch (_) { return state.saveUrls?.[id] || ''; } }
+function setSaveUrl(id, url) { (state.saveUrls ||= {})[id] = url; try { url ? localStorage.setItem(saveUrlKey(id), url) : localStorage.removeItem(saveUrlKey(id)); } catch (_) {} }
+const isScriptUrl = u => /^https:\/\/script\.google(usercontent)?\.com\/.*\/exec(\?.*)?$/.test(str(u));
+
+async function callScript(url, body) {
+  let res;
+  try {
+    res = body ? await fetch(url, {method: 'POST', headers: {'Content-Type': 'text/plain;charset=utf-8'}, body: JSON.stringify(body)}) : await fetch(url);
+  } catch (e) { throw new Error('Could not reach the save link. Check that it was deployed with Who has access: "Anyone".'); }
+  const text = await res.text();
+  try { return JSON.parse(text); } catch (_) {
+    throw new Error('The save link did not answer correctly. Make sure the deployment is a "Web app" with Who has access: "Anyone" (not "Only myself").');
+  }
+}
+
+function openGoogleSetup(thenSave = false) {
+  const f = state.files.find(x => x.gsheet); if (!f) return;
+  const cur = getSaveUrl(f.gsheet);
+  const d = dialog(`<h3>Connect the Google Sheet for saving</h3>
+    <p>Google only lets a sheet be changed by something its owner has approved. This one-time setup adds a small script to <b>your</b> sheet that lets this viewer save edits into it. Ask the sheet's owner (or someone with edit access) to do it.</p>
+    <ol class="steps">
+      <li>Open the Google Sheet. In the menu choose <b>Extensions → Apps Script</b>.</li>
+      <li>Delete everything in the code box, then paste the script below (use the <b>Copy script</b> button). Click the 💾 <b>Save</b> icon.</li>
+      <li>Click <b>Deploy → New deployment</b>. Click the ⚙ gear next to “Select type” and choose <b>Web app</b>.</li>
+      <li>Set <b>Execute as: Me</b> and <b>Who has access: Anyone</b>. Click <b>Deploy</b>.</li>
+      <li>Click <b>Authorize access</b> and choose your Google account. If you see “Google hasn’t verified this app”, click <b>Advanced → Go to … (unsafe)</b> → <b>Allow</b>. (It is your own script, so this is expected.)</li>
+      <li>Copy the <b>Web app URL</b> (it ends in <code>/exec</code>) and paste it here:</li>
+    </ol>
+    <div class="link-form"><input id="gsUrl" type="url" placeholder="https://script.google.com/macros/s/…/exec" value="${esc(cur)}"><button class="btn" type="button" id="gsConnect">Connect</button></div>
+    <p class="err" id="gsErr"></p><p class="ok-msg" id="gsOk"></p>
+    <details class="code"><summary>Show the script</summary><pre>${esc(APPS_SCRIPT)}</pre></details>
+    <div class="dlg-act"><button class="btn ghost" type="button" id="gsCopy">Copy script</button>
+      <button class="btn ghost" type="button" id="gsShare" ${cur ? '' : 'hidden'}>Copy link for colleagues</button>
+      ${cur ? `<button class="btn ghost" type="button" id="gsForget">Disconnect</button>` : ''}</div>
+    <p class="muted small">Anyone who has the Web app URL (or the colleagues link) can save changes to this sheet, so share it only with people who should edit. Changes appear in the sheet's version history.</p>`, 'wide');
+  $('#gsCopy').onclick = () => { navigator.clipboard?.writeText(APPS_SCRIPT).then(() => toast('Script copied — paste it in Apps Script'), () => toast('Copy failed — use “Show the script”', true)); };
+  $('#gsShare').onclick = () => {
+    const link = location.origin + location.pathname + '#sheet=' + f.gsheet + '&save=' + encodeURIComponent(getSaveUrl(f.gsheet));
+    navigator.clipboard?.writeText(link).then(() => toast('Link copied — colleagues who open it can edit and save'));
+  };
+  if ($('#gsForget')) $('#gsForget').onclick = () => { setSaveUrl(f.gsheet, ''); d.close(); toast('Disconnected'); };
+  $('#gsConnect').onclick = async () => {
+    const url = str($('#gsUrl').value);
+    $('#gsErr').textContent = ''; $('#gsOk').textContent = '';
+    if (!isScriptUrl(url)) { $('#gsErr').textContent = 'That is not an Apps Script Web app URL — it should start with https://script.google.com/ and end with /exec.'; return; }
+    $('#gsConnect').disabled = true; $('#gsConnect').textContent = 'Checking…';
+    try {
+      const j = await callScript(url);
+      if (!j.ok) throw new Error(j.error || 'The script did not answer.');
+      if (j.id !== f.gsheet) throw new Error(`This script belongs to a different spreadsheet (“${j.name}”). Add it to the sheet you opened here.`);
+      setSaveUrl(f.gsheet, url); f.title = j.name;
+      $('#gsOk').textContent = `Connected to “${j.name}”.`; $('#gsShare').hidden = false;
+      if (thenSave) { d.close(); saveToGoogle(); }
+    } catch (e) { $('#gsErr').textContent = e.message; }
+    finally { $('#gsConnect').disabled = false; $('#gsConnect').textContent = 'Connect'; }
+  };
+}
+
+async function saveToGoogle(force = false) {
+  const f = state.files.find(x => x.gsheet); if (!f) return;
+  const url = getSaveUrl(f.gsheet);
+  if (!url) { openGoogleSetup(true); return; }
+  const items = [...pending.entries()].filter(([, e]) => e.sh.file === f);
+  if (!items.length) { toast('Nothing to save'); return; }
+  const btn = $('#cbSave'); btn.disabled = true; btn.textContent = 'Saving…';
+  try {
+    const j = await callScript(url, {id: f.gsheet, force, changes: items.map(([, e]) =>
+      ({sheet: e.sh.name, tab: f.wb.SheetNames.indexOf(e.sh.name), row: e.r + 1, col: e.c + 1, old: e.old, value: e.value}))});
+    if (!j.ok) throw new Error(j.error || 'Saving failed.');
+    if (j.name) f.title = j.name;
+    const conflicts = [], errors = [];
+    (j.results || []).forEach((r, i) => {
+      const [k, e] = items[i];
+      if (r.ok) pending.delete(k);
+      else if (r.conflict) conflicts.push({e, current: r.current});
+      else errors.push(`${e.field} (${e.sh.name} row ${e.r + 1}): ${r.error}`);
+    });
+    refresh();
+    const saved = items.length - conflicts.length - errors.length;
+    if (saved) toast(`Saved ${saved} change${saved > 1 ? 's' : ''} to “${f.title || 'Google Sheet'}”`);
+    if (conflicts.length || errors.length) showSaveProblems(conflicts, errors);
+  } catch (e) {
+    toast(e.message, true);
+    if (/answer correctly|reach/.test(e.message)) openGoogleSetup(true);
+  } finally { btn.disabled = false; btn.textContent = 'Save to Google Sheet'; }
+}
+function showSaveProblems(conflicts, errors) {
+  dialog(`<h3>Some changes were not saved</h3>` +
+    (conflicts.length ? `<p>These cells were changed in the Google Sheet by someone else since you opened it, so they were left alone:</p><div class="rv">${conflicts.map(({e, current}) =>
+      `<div class="rv-item"><div class="rv-h"><b>${esc(e.row.question_label || '')}</b><span class="muted">${esc(e.sh.name)} · row ${e.r + 1} · ${esc(e.field)}</span></div>` +
+      `<div class="rv-diff"><div><i>Now in the sheet</i><pre>${esc(current)}</pre></div><div><i>Your version</i><pre>${esc(e.value)}</pre></div></div></div>`).join('')}</div>` : '') +
+    (errors.length ? `<ul class="err">${errors.map(x => `<li>${esc(x)}</li>`).join('')}</ul>` : '') +
+    `<div class="dlg-act">${conflicts.length ? `<button class="btn" type="button" id="spForce">Overwrite with my version</button>` : ''}<button class="btn ghost" type="button" data-close>Keep them unsaved</button></div>`, 'wide');
+  if ($('#spForce')) $('#spForce').onclick = () => { $('#dlg').close(); saveToGoogle(true); };
+}
+
+// open "#sheet=<id>&save=<url>" links (shared from the Google setup dialog)
+(() => {
+  const h = new URLSearchParams(location.hash.slice(1));
+  const id = h.get('sheet'), save = h.get('save');
+  if (!id || !/^[\w-]{20,}$/.test(id)) return;
+  if (save && isScriptUrl(save)) setSaveUrl(id, save);
+  loadLink('https://docs.google.com/spreadsheets/d/' + id + '/edit');
+})();
 // image fallbacks (Drive links etc.)
 document.addEventListener('error', e => {
   const img = e.target;
@@ -655,5 +1047,5 @@ const setTb = () => document.documentElement.style.setProperty('--tb', $('.topba
 new ResizeObserver(setTb).observe($('.topbar')); setTb();
 
 // expose for testing
-window.QV = {parseSheets, buildModel, rich, answerHTML, loadFiles, state};
+window.QV = {parseSheets, buildModel, rich, answerHTML, loadFiles, state, pending, setField, APPS_SCRIPT};
 })();

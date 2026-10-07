@@ -22,6 +22,7 @@
     <label class="btn" for="fileInput">Upload file</label>
     <input type="file" id="fileInput" accept=".xlsx,.xls,.xlsm,.ods,.csv,.tsv" multiple hidden>
     <button class="btn ghost" id="linkBtn" type="button">Open Google Sheet link</button>
+    <button class="btn ghost" id="dlBtn" type="button" title="Download the sheet, including your edits" hidden>⬇ Download</button>
     <button class="btn ghost" id="themeBtn" type="button" title="Toggle dark mode">◐</button>
   </div>
 </header>
@@ -63,8 +64,10 @@
         <label><input type="checkbox" id="tMark" checked> Marking</label>
         <label><input type="checkbox" id="tMeta"> Metadata</label>
         <label><input type="checkbox" id="tRaw"> Raw source</label>
+        <label class="edit-toggle"><input type="checkbox" id="tEdit"> ✎ Edit</label>
       </div>
     </div>
+    <div class="edit-hint" id="editHint" hidden>✎ <b>Editing is on.</b> Click any question, option, answer or explanation to change it — highlight a word first to jump straight to it. Use <b>All fields</b> on a card for marks, difficulty, correct answers and every other column.</div>
     <div class="summary" id="summary"></div>
     <div id="issues" class="issues" hidden></div>
     <div id="list" class="list"></div>
@@ -72,6 +75,14 @@
 </main>
 
 <div id="lightbox" class="lightbox" hidden><img alt=""><p></p></div>
+<div id="changeBar" class="change-bar" hidden>
+  <span id="cbText"></span>
+  <button class="btn ghost" id="cbReview" type="button">Review</button>
+  <button class="btn" id="cbSave" type="button" hidden>Save to Google Sheet</button>
+  <button class="btn" id="cbDl" type="button">Download edited file</button>
+</div>
+<div id="toast" class="toast" role="status" hidden></div>
+<dialog id="dlg"></dialog>
 <script src="app.js"></script>
 </body>
 </html>
