@@ -891,28 +891,28 @@ var KEY = '%%KEY%%'; // only the viewer that gave you this script knows this key
 var SHEET_MIME = 'application/vnd.google-apps.spreadsheet';
 var XLSX_MIME = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
 
-function doGet(e) { return run_(JSON.parse((e && e.parameter && e.parameter.q) || '{}')); }
-function doPost(e) { return run_(JSON.parse(e.postData.contents)); }
+function doGet(e) { var p = (e && e.parameter) || {}; return out_(run_(JSON.parse(p.q || '{}')), p.callback); }
+function doPost(e) { return out_(run_(JSON.parse(e.postData.contents))); }
 
 function run_(req) {
   try {
-    if (req.key !== KEY) return json_({ok: false, badKey: true, error: 'The key does not match this script.'});
-    if (!req.id) return json_({ok: true, ready: true});
+    if (req.key !== KEY) return ({ok: false, badKey: true, error: 'The key does not match this script.'});
+    if (!req.id) return ({ok: true, ready: true});
     var file = DriveApp.getFileById(req.id);
     var mime = file.getMimeType();
     if (mime !== SHEET_MIME && mime !== XLSX_MIME) {
-      return json_({ok: false, error: '"' + file.getName() + '" is not a Google Sheet or an .xlsx file.'});
+      return ({ok: false, error: '"' + file.getName() + '" is not a Google Sheet or an .xlsx file.'});
     }
-    if (!req.changes) return json_({ok: true, name: file.getName(), kind: mime === SHEET_MIME ? 'sheet' : 'xlsx'});
+    if (!req.changes) return ({ok: true, name: file.getName(), kind: mime === SHEET_MIME ? 'sheet' : 'xlsx'});
     var lock = LockService.getScriptLock();
     lock.waitLock(60000);
     try {
-      return json_(mime === SHEET_MIME ? saveSheet_(file, req) : saveXlsx_(file, req));
+      return (mime === SHEET_MIME ? saveSheet_(file, req) : saveXlsx_(file, req));
     } finally {
       lock.releaseLock();
     }
   } catch (err) {
-    return json_({ok: false, error: String((err && err.message) || err)});
+    return ({ok: false, error: String((err && err.message) || err)});
   }
 }
 
@@ -962,7 +962,12 @@ function apply_(ss, req) {
 }
 
 function norm_(s) { return String(s == null ? '' : s).replace(/\\s+/g, ' ').trim(); }
-function json_(o) { return ContentService.createTextOutput(JSON.stringify(o)).setMimeType(ContentService.MimeType.JSON); }
+function out_(o, callback) {
+  if (callback && /^[\\w$]+$/.test(callback)) { // JSONP: works even when the web app is limited to your organisation
+    return ContentService.createTextOutput(callback + '(' + JSON.stringify(o) + ')').setMimeType(ContentService.MimeType.JAVASCRIPT);
+  }
+  return ContentService.createTextOutput(JSON.stringify(o)).setMimeType(ContentService.MimeType.JSON);
+}
 `;
 /** One save script serves every sheet, so the connection (web-app URL + key) is stored once per browser. */
 const store = {
@@ -978,16 +983,54 @@ function scriptKey() {
 const scriptText = () => APPS_SCRIPT.replace('%%KEY%%', scriptKey());
 const isScriptUrl = u => /^https:\/\/script\.google(usercontent)?\.com\/.*\/exec(\?.*)?$/.test(str(u));
 
-async function callScript(url, body, post = true) {
-  let res;
-  try {
-    res = post ? await fetch(url, {method: 'POST', headers: {'Content-Type': 'text/plain;charset=utf-8'}, body: JSON.stringify(body)})
-               : await fetch(url + (url.includes('?') ? '&' : '?') + 'q=' + encodeURIComponent(JSON.stringify(body)));
-  } catch (e) { throw new Error('Could not reach the save link. Check that it was deployed with Who has access: "Anyone".'); }
-  const text = await res.text();
-  try { return JSON.parse(text); } catch (_) {
-    throw new Error('The save link did not answer correctly. Make sure the deployment is a "Web app" with Who has access: "Anyone" (not "Only myself").');
+const UNREACHABLE = 'Could not reach the save script. In Apps Script check Deploy → Manage deployments: it must be a "Web app", Execute as "Me", ' +
+  'and Who has access "Anyone" or "Anyone within your organisation" (then you must be signed in to Google with that account in this browser). ' +
+  'If you changed the script, choose Version: "New version" and Deploy again.';
+/** JSONP call (a <script> tag): needs no CORS and sends your Google sign-in, so it also works for organisation-only web apps. */
+function jsonp(url, body) {
+  return new Promise((resolve, reject) => {
+    const cb = '__qv' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+    const el = document.createElement('script');
+    let called = false;
+    const done = (err, data) => { clearTimeout(timer); delete window[cb]; el.remove(); err ? reject(err) : resolve(data); };
+    const timer = setTimeout(() => done(new Error(UNREACHABLE)), 120000);
+    window[cb] = data => { called = true; done(null, data); };
+    el.onerror = () => done(new Error(UNREACHABLE));
+    el.onload = () => setTimeout(() => { if (!called) done(new Error(UNREACHABLE)); }, 50);
+    el.src = url + (url.includes('?') ? '&' : '?') + 'callback=' + cb + '&q=' + encodeURIComponent(JSON.stringify(body));
+    document.head.appendChild(el);
+  });
+}
+/** JSONP puts the data in the URL, so big saves are split into several smaller requests. */
+async function jsonpBatched(url, body) {
+  if (!body.changes) return jsonp(url, body);
+  const batches = [];
+  let cur = [], size = 0;
+  for (const c of body.changes) {
+    const n = encodeURIComponent(JSON.stringify(c)).length;
+    if (cur.length && size + n > 6000) { batches.push(cur); cur = []; size = 0; }
+    cur.push(c); size += n;
   }
+  if (cur.length) batches.push(cur);
+  let last = null; const results = [];
+  for (const changes of batches) {
+    last = await jsonp(url, {...body, changes});
+    if (!last.ok) return last;
+    results.push(...(last.results || []));
+  }
+  return {...last, results};
+}
+async function callScript(url, body, post = true) {
+  if (store.get('qv-save-mode') !== 'jsonp') {
+    try {
+      const res = post ? await fetch(url, {method: 'POST', headers: {'Content-Type': 'text/plain;charset=utf-8'}, body: JSON.stringify(body)})
+                       : await fetch(url + (url.includes('?') ? '&' : '?') + 'q=' + encodeURIComponent(JSON.stringify(body)));
+      return JSON.parse(await res.text());
+    } catch (_) { /* blocked (e.g. organisation-only web app) or not JSON: fall back to JSONP */ }
+  }
+  const j = await jsonpBatched(url, body);
+  store.set('qv-save-mode', 'jsonp');
+  return j;
 }
 
 function openGoogleSetup(thenSave = false) {
@@ -999,7 +1042,7 @@ function openGoogleSetup(thenSave = false) {
       <li>Open <a href="https://script.google.com/home/projects/create" target="_blank" rel="noopener"><b>script.google.com → New project</b></a> (signed in with the account that can edit the sheet).</li>
       <li>Delete everything in the code box, then paste the script (use the <b>Copy script</b> button below). Click the 💾 <b>Save</b> icon.</li>
       <li>Click <b>Deploy → New deployment</b>. Click the ⚙ gear next to “Select type” and choose <b>Web app</b>.</li>
-      <li>Set <b>Execute as: Me</b> and <b>Who has access: Anyone</b>. Click <b>Deploy</b>.</li>
+      <li>Set <b>Execute as: Me</b> and <b>Who has access: Anyone</b> (if your school account doesn’t offer that, choose <b>Anyone within</b> your organisation). Click <b>Deploy</b>.</li>
       <li>Click <b>Authorize access</b> and choose your Google account. If you see “Google hasn’t verified this app”, click <b>Advanced → Go to … (unsafe)</b> → <b>Allow</b>. (It is your own script, so this is expected. It asks for Drive access because it saves into your files.)</li>
       <li>Copy the <b>Web app URL</b> (it ends in <code>/exec</code>) and paste it here:</li>
     </ol>
@@ -1018,21 +1061,21 @@ function openGoogleSetup(thenSave = false) {
     const link = location.origin + location.pathname + '#sheet=' + f.gsheet + '&save=' + encodeURIComponent(c.url) + '&key=' + c.key;
     navigator.clipboard?.writeText(link).then(() => toast('Link copied — colleagues who open it can edit and save'));
   };
-  if ($('#gsForget')) $('#gsForget').onclick = () => { store.set('qv-save-url', ''); d.close(); toast('Disconnected'); };
+  if ($('#gsForget')) $('#gsForget').onclick = () => { store.set('qv-save-url', ''); store.set('qv-save-mode', ''); d.close(); toast('Disconnected'); };
   $('#gsConnect').onclick = async () => {
     const url = str($('#gsUrl').value), key = str($('#gsKey').value) || scriptKey();
     $('#gsErr').textContent = ''; $('#gsOk').textContent = '';
     if (!isScriptUrl(url)) { $('#gsErr').textContent = 'That is not an Apps Script Web app URL — it should start with https://script.google.com/ and end with /exec.'; return; }
-    $('#gsConnect').disabled = true; $('#gsConnect').textContent = 'Checking…';
+    $('#gsConnect').disabled = true; $('#gsConnect').textContent = 'Checking…'; store.set('qv-save-mode', '');
     try {
       const j = await callScript(url, {key, id: f.gsheet}, false);
       if (j.badKey) { $('#gsKeyRow').hidden = false; throw new Error('The key does not match this script — see the box above.'); }
-      if (!j.ok) throw new Error(j.error || 'The script did not answer.');
+      if (!j.ok) throw Object.assign(new Error(j.error || 'The script did not answer.'), {fromScript: true});
       store.set('qv-save-url', url); store.set('qv-save-key', key); f.title = j.name;
       $('#gsOk').textContent = `Connected — saving to “${j.name}”${j.kind === 'xlsx' ? ' (an .xlsx file; saving takes a few seconds)' : ''}.`; $('#gsShare').hidden = false;
       if (thenSave) { d.close(); saveToGoogle(); }
     } catch (e) {
-      $('#gsErr').textContent = /not found|no item|access/i.test(e.message) && !/key/.test(e.message)
+      $('#gsErr').textContent = e.fromScript && /not found|no item|denied|permission/i.test(e.message)
         ? `The script could not open this file (${e.message}). Make sure the account you deployed the script with can edit it.` : e.message;
     } finally { $('#gsConnect').disabled = false; $('#gsConnect').textContent = 'Connect'; }
   };
@@ -1064,7 +1107,7 @@ async function saveToGoogle(force = false) {
     if (conflicts.length || errors.length) showSaveProblems(conflicts, errors);
   } catch (e) {
     toast(e.message, true);
-    if (/answer correctly|reach|key/.test(e.message)) openGoogleSetup(true);
+    if (/reach the save|key/.test(e.message)) openGoogleSetup(true);
   } finally { btn.disabled = false; btn.textContent = 'Save to Google Sheet'; }
 }
 function showSaveProblems(conflicts, errors) {
