@@ -48,6 +48,8 @@ function onOpen() {
     .createMenu('Master Format')
     .addItem('Expanded → Compact', 'convertToCompact')
     .addItem('Compact → Expanded', 'convertToExpanded')
+    .addSeparator()
+    .addItem('Fix image tags only (<img> → [img])', 'fixImageTagsActive')
     .addToUi();
 }
 
@@ -57,6 +59,12 @@ function convertToCompact() {
 
 function convertToExpanded() {
   convertActive_('expanded');
+}
+
+function fixImageTagsActive() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var n = fixImageTags_(ss);
+  ss.toast(n + ' cell(s) fixed.', 'Master Format', 5);
 }
 
 function convertActive_(direction) {
@@ -207,6 +215,9 @@ function convertSpreadsheet_(ss, direction) {
   }
 
   var output = convertFn(input, order);
+  order.forEach(function (name) {
+    output[name] = output[name].map(function (r) { return r.map(imgToBracket_); });
+  });
 
   order.forEach(function (name) {
     var sh = ss.getSheetByName(name);
@@ -220,6 +231,40 @@ function convertSpreadsheet_(ss, direction) {
       sh.getRange(FIRST_DATA_ROW, 1, newRows.length, width).setValues(newRows);
     }
   });
+}
+
+/* ------------------------------------------------------------------ */
+/* Image tags                                                          */
+/* ------------------------------------------------------------------ */
+
+/**
+ * The renderer reads images as [img src="…" alt="…"]. Turns HTML-style
+ * <img src="…" alt="…" /> back into that form; other values are unchanged.
+ */
+function imgToBracket_(value) {
+  if (typeof value !== 'string' || value.indexOf('<img') === -1) return value;
+  return value.replace(/<img\s+([^>]*?)\s*\/?>/gi, '[img $1]');
+}
+
+/** Converts image tags in every master sheet's data rows. Returns cells changed. */
+function fixImageTags_(ss) {
+  var changed = 0;
+  ss.getSheets().forEach(function (sh) {
+    var lastRow = sh.getLastRow(), lastCol = sh.getLastColumn();
+    if (lastRow < FIRST_DATA_ROW || lastCol === 0) return;
+    var range = sh.getRange(FIRST_DATA_ROW, 1, lastRow - FIRST_DATA_ROW + 1, lastCol);
+    var values = range.getValues();
+    var dirty = false;
+    values = values.map(function (r) {
+      return r.map(function (v) {
+        var nv = imgToBracket_(v);
+        if (nv !== v) { changed++; dirty = true; }
+        return nv;
+      });
+    });
+    if (dirty) range.setValues(values);
+  });
+  return changed;
 }
 
 /* ------------------------------------------------------------------ */
