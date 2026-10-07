@@ -88,8 +88,11 @@ function imgHTML(attrStr) {
          (alt ? `<figcaption>${esc(alt)}</figcaption>` : '') + `</figure>`;
 }
 
-const TOKEN_SRC = /\[katex\]([\s\S]*?)(?:\[\/katex\]|$)|\[img\s+([^\]]*)\]|\$\$([^$\n]{1,40})\$\$|\\\((.+?)\\\)|<br\s*\/?>|\r?\n/gi;
-const SAFE_TAGS = /&lt;(\/?)(b|i|u|strong|em|sub|sup|p|ul|ol|li|table|tr|td|th|thead|tbody)&gt;/gi;
+const TOKEN_SRC = /\[katex\]([\s\S]*?)(?:\[\/katex\]|$)|\[img\s+([^\]]*)\]|\$\$([^$\n]{1,40})\$\$|\\\((.+?)\\\)|<img\b([^>]*?)\/?>|<br\s*\/?>|\r?\n/gi;
+const SAFE_TAGS = /&lt;(\/?)(b|i|u|s|strong|em|sub|sup|p|ul|ol|li|table|tr|td|th|thead|tbody|span|div|code|pre|blockquote|h[1-6]|hr)\s*\/?&gt;/gi;
+// HTML entities written in the sheet (&nbsp; &deg; &#937; …) should show as characters, not as text
+const ENTITY = /&amp;(#\d{1,6}|#x[0-9a-f]{1,6}|[a-z]{2,8}\d?);/gi;
+const plain = t => esc(t).replace(SAFE_TAGS, '<$1$2>').replace(ENTITY, '&$1;');
 
 /** ctx.blanks: {placeholder -> answer} for $$a$$ style blanks */
 function rich(src, ctx = {}) {
@@ -99,7 +102,7 @@ function rich(src, ctx = {}) {
   const TOKEN = new RegExp(TOKEN_SRC.source, 'gi'); // fresh per call (rich() recurses for blanks)
   while ((m = TOKEN.exec(s))) {
     if (m[0] === '' ) { TOKEN.lastIndex++; continue; }
-    out += esc(s.slice(last, m.index)).replace(SAFE_TAGS, '<$1$2>');
+    out += plain(s.slice(last, m.index));
     if (m[1] !== undefined && /^\[katex\]/i.test(m[0])) out += tex(m[1]);
     else if (m[2] !== undefined) out += imgHTML(m[2]);
     else if (m[3] !== undefined) {
@@ -109,10 +112,11 @@ function rich(src, ctx = {}) {
              (ans ? `<span class="ph-a ans-only">${rich(ans)}</span>` : '') + `</span>`;
     }
     else if (m[4] !== undefined) out += tex(m[4]);
+    else if (m[5] !== undefined) out += imgHTML(m[5]); // HTML <img src="…" alt="…" />
     else out += '<br>';
     last = TOKEN.lastIndex;
   }
-  out += esc(s.slice(last)).replace(SAFE_TAGS, '<$1$2>');
+  out += plain(s.slice(last));
   return out;
 }
 /** Answer content: "Equation" typed cells often hold bare LaTeX without [Katex] tags */

@@ -12,7 +12,7 @@ Everything runs in the browser — uploaded files never leave your computer.
 
 ## What it understands
 - `[Katex]…[/Katex]` → rendered maths; bare LaTeX in *Equation*-type answer cells (e.g. `\text{…}`) is rendered too.
-- `[img src="…" alt="…"]` → images (Google Drive `/file/d/…/view` links are converted automatically;
+- `[img src="…" alt="…"]` and HTML `<img src="…" alt="…" />` → images (Google Drive `/file/d/…/view` links are converted automatically;
   Drive images must be shared as *Anyone with the link*). Click an image to enlarge.
 - `$$a$$` placeholders → blanks; with **Answers** on they show the accepted answer.
 - `<br>` and line breaks.
