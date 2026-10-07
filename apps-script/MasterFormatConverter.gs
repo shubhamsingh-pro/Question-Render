@@ -18,8 +18,10 @@
  *  1. Bound to a Google Sheet (Extensions → Apps Script):
  *       menu "Master Format" → "Expanded → Compact" / "Compact → Expanded".
  *  2. Standalone project (script.google.com) for .xlsx files in Drive:
- *       set FILE_URL below, then run fileToCompact or fileToExpanded.
- *  3. Standalone project deployed as a Web app: paste a Drive link in the page.
+ *       list files and/or folders in FILE_URLS below, then run
+ *       fileToCompact or fileToExpanded.
+ *  3. Standalone project deployed as a Web app: paste one or more Drive
+ *       file or folder links (one per line) in the page.
  *
  *  In modes 2 and 3 the file itself is converted in place (same file, same
  *  link, no new file): an .xlsx stays .xlsx, a Google Sheet stays a Google
@@ -33,8 +35,11 @@ var HEADER_ROW = 2;        // row holding the column names
 var FIRST_DATA_ROW = 3;    // first data row
 var LIST_SEP = '|';        // separator used in *_labels / *_topics cells
 
-// Mode 2: link (or ID) of the Drive file to convert.
-var FILE_URL = 'PASTE_DRIVE_FILE_LINK_HERE';
+// Mode 2: Drive links (or IDs) of the files to convert. A folder link
+// converts every .xlsx / Google Sheet directly inside that folder.
+var FILE_URLS = [
+  'PASTE_DRIVE_FILE_OR_FOLDER_LINK_HERE'
+];
 
 var XLSX_MIME = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
 var GSHEET_MIME = 'application/vnd.google-apps.spreadsheet';
@@ -78,15 +83,28 @@ function convertActive_(direction) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Mode 2: run from the script editor on a Drive file (.xlsx or Sheet) */
+/* Mode 2: run from the script editor on Drive files / folders         */
 /* ------------------------------------------------------------------ */
 
 function fileToCompact() {
-  Logger.log('Converted: ' + convertDriveFile(FILE_URL, 'compact'));
+  convertMany_(FILE_URLS, 'compact');
 }
 
 function fileToExpanded() {
-  Logger.log('Converted: ' + convertDriveFile(FILE_URL, 'expanded'));
+  convertMany_(FILE_URLS, 'expanded');
+}
+
+function convertMany_(links, direction) {
+  var files = resolveLinks(links.join('\n'));
+  files.forEach(function (f) {
+    try {
+      convertDriveFile(f.id, direction);
+      Logger.log('OK     ' + f.name);
+    } catch (e) {
+      Logger.log('FAILED ' + f.name + ': ' + e.message);
+    }
+  });
+  Logger.log('Finished ' + files.length + ' file(s).');
 }
 
 /* ------------------------------------------------------------------ */
@@ -95,19 +113,68 @@ function fileToExpanded() {
 
 function doGet() {
   return HtmlService.createHtmlOutput(
-    '<div style="font-family:sans-serif;max-width:560px;margin:24px auto">' +
+    '<div style="font-family:sans-serif;max-width:720px;margin:24px auto">' +
     '<h3>Master format converter</h3>' +
-    '<p>Drive link of the .xlsx or Google Sheet:</p>' +
-    '<input id="u" style="width:100%;padding:6px">' +
+    '<p>Drive links of .xlsx files, Google Sheets or folders, one per line:</p>' +
+    '<textarea id="u" rows="8" style="width:100%;padding:6px"></textarea>' +
     '<p><button onclick="go(\'compact\')">Expanded → Compact</button> ' +
     '<button onclick="go(\'expanded\')">Compact → Expanded</button></p>' +
-    '<p id="s"></p></div>' +
-    '<script>function go(d){var s=document.getElementById("s");s.textContent="Working…";' +
-    'google.script.run.withSuccessHandler(function(u){s.innerHTML=' +
-    '"Done: <a target=_blank href=\\""+u+"\\">open file</a>";})' +
-    '.withFailureHandler(function(e){s.textContent="Error: "+e.message;})' +
-    '.convertDriveFile(document.getElementById("u").value,d);}</script>'
+    '<p id="s"></p><ol id="list"></ol></div>' +
+    '<script>' +
+    'function esc(t){var d=document.createElement("div");d.textContent=t;return d.innerHTML;}' +
+    'function go(dir){var s=document.getElementById("s"),list=document.getElementById("list");' +
+    'list.innerHTML="";s.textContent="Finding files…";' +
+    'google.script.run.withFailureHandler(function(e){s.textContent="Error: "+e.message;})' +
+    '.withSuccessHandler(function(files){if(!files.length){s.textContent="No .xlsx or Google Sheet found.";return;}' +
+    'var done=0,failed=0;s.textContent="Converting "+files.length+" file(s)…";' +
+    'var items=files.map(function(f){var li=document.createElement("li");li.innerHTML=esc(f.name)+" — waiting";list.appendChild(li);return li;});' +
+    'function next(i){if(i>=files.length){s.textContent="Finished: "+done+" converted, "+failed+" failed.";return;}' +
+    'items[i].innerHTML=esc(files[i].name)+" — converting…";' +
+    'google.script.run.withSuccessHandler(function(url){done++;' +
+    'items[i].innerHTML="<a target=_blank href=\\""+url+"\\">"+esc(files[i].name)+"</a> — ✅ done";next(i+1);})' +
+    '.withFailureHandler(function(e){failed++;items[i].innerHTML=esc(files[i].name)+" — ❌ "+esc(e.message);next(i+1);})' +
+    '.convertDriveFile(files[i].id,dir);}' +
+    'next(0);}).resolveLinks(document.getElementById("u").value);}' +
+    '</script>'
   ).setTitle('Master format converter');
+}
+
+/**
+ * Turns pasted text (file or folder links / IDs, one per line) into a list
+ * of {id, name} for every .xlsx or Google Sheet. Folders are not recursive.
+ */
+function resolveLinks(text) {
+  var out = [];
+  var seen = {};
+  var add = function (file) {
+    var mime = file.getMimeType();
+    if ((mime === XLSX_MIME || mime === GSHEET_MIME) && !seen[file.getId()]) {
+      seen[file.getId()] = true;
+      out.push({ id: file.getId(), name: file.getName() });
+    }
+  };
+  String(text).split(/[\n,]+/).forEach(function (line) {
+    line = line.trim();
+    if (!line || line.indexOf('PASTE_') === 0) return;
+    var folder = line.match(/\/folders\/([a-zA-Z0-9_-]+)/);
+    if (folder) {
+      var files = DriveApp.getFolderById(folder[1]).getFiles();
+      while (files.hasNext()) add(files.next());
+      return;
+    }
+    var id = fileIdFromUrl_(line);
+    var item;
+    try {
+      item = DriveApp.getFileById(id);
+    } catch (e) {
+      // Bare ID of a folder.
+      var fs = DriveApp.getFolderById(id).getFiles();
+      while (fs.hasNext()) add(fs.next());
+      return;
+    }
+    add(item);
+  });
+  return out;
 }
 
 /**
@@ -398,15 +465,20 @@ function toCompact_(input, order) {
 
 function toExpanded_(input, order) {
   // 1. Collect Group / Concept / Topic / Chapter rows from every sheet.
+  //    Question rows that already have them (file already expanded) count too.
   var meta = { group: [], concept: [], topic: [], chapter: [] };
+  var metaIndex = { group: {}, concept: {}, topic: {}, chapter: {} };
   order.forEach(function (name) {
     var sheet = input[name];
     var L = layout_(sheet.header);
     sheet.rows.forEach(function (row) {
-      if (!isBlank_(slice_(row, L.question))) return;
       ['group', 'concept', 'topic', 'chapter'].forEach(function (k) {
         var block = getBlock_(row, sheet.header, L[k]);
-        if (!isBlankBlock_(block)) meta[k].push(block);
+        if (isBlankBlock_(block)) return;
+        var key = blockKey_(block);
+        if (key in metaIndex[k]) return;
+        metaIndex[k][key] = meta[k].length;
+        meta[k].push(block);
       });
     });
   });
@@ -456,10 +528,12 @@ function toExpanded_(input, order) {
     var concept = findConcept(qLabel);
     var topic = findTopic(concept);
     var chapter = findChapter(topic);
-    if (group) putBlock_(row, header, L.group, group);
-    if (concept) putBlock_(row, header, L.concept, concept);
-    if (topic) putBlock_(row, header, L.topic, topic);
-    if (chapter) putBlock_(row, header, L.chapter, chapter);
+    // Columns the row already has are kept as they are.
+    var keep = function (k) { return !isBlankBlock_(getBlock_(row, header, L[k])); };
+    if (group && !keep('group')) putBlock_(row, header, L.group, group);
+    if (concept && !keep('concept')) putBlock_(row, header, L.concept, concept);
+    if (topic && !keep('topic')) putBlock_(row, header, L.topic, topic);
+    if (chapter && !keep('chapter')) putBlock_(row, header, L.chapter, chapter);
   };
 
   // 2. Rebuild each sheet's question rows with their parent columns.
@@ -473,7 +547,8 @@ function toExpanded_(input, order) {
       if (isBlank_(slice_(row, L.question))) return;
       var r = row.slice();
       var qLabel = String(row[qLabelCol]).trim();
-      var gi = findGroup(qLabel);
+      var own = getBlock_(row, sheet.header, L.group);
+      var gi = isBlankBlock_(own) ? findGroup(qLabel) : metaIndex.group[blockKey_(own)];
       if (gi !== -1) used[gi] = true;
       fill(r, sheet.header, L, qLabel, gi !== -1 ? meta.group[gi] : null);
       out[name].push(r);
