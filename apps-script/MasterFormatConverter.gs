@@ -21,8 +21,10 @@
  *       set FILE_URL below, then run fileToCompact or fileToExpanded.
  *  3. Standalone project deployed as a Web app: paste a Drive link in the page.
  *
- *  In modes 2 and 3 the original file is never changed. A converted copy is
- *  saved next to it: an .xlsx stays .xlsx, a Google Sheet stays a Google Sheet.
+ *  In modes 2 and 3 the file itself is converted in place (same file, same
+ *  link, no new file): an .xlsx stays .xlsx, a Google Sheet stays a Google
+ *  Sheet. Undo with File → Version history (Google Sheet) or
+ *  Manage versions (.xlsx in Drive), or simply convert the other way.
  */
 
 // Sheet that receives the Group / Concept / Topic / Chapter rows in COMPACT form.
@@ -72,11 +74,11 @@ function convertActive_(direction) {
 /* ------------------------------------------------------------------ */
 
 function fileToCompact() {
-  Logger.log('Saved: ' + convertDriveFile(FILE_URL, 'compact'));
+  Logger.log('Converted: ' + convertDriveFile(FILE_URL, 'compact'));
 }
 
 function fileToExpanded() {
-  Logger.log('Saved: ' + convertDriveFile(FILE_URL, 'expanded'));
+  Logger.log('Converted: ' + convertDriveFile(FILE_URL, 'expanded'));
 }
 
 /* ------------------------------------------------------------------ */
@@ -94,51 +96,61 @@ function doGet() {
     '<p id="s"></p></div>' +
     '<script>function go(d){var s=document.getElementById("s");s.textContent="Working…";' +
     'google.script.run.withSuccessHandler(function(u){s.innerHTML=' +
-    '"Done: <a target=_blank href=\\""+u+"\\">open converted file</a>";})' +
+    '"Done: <a target=_blank href=\\""+u+"\\">open file</a>";})' +
     '.withFailureHandler(function(e){s.textContent="Error: "+e.message;})' +
     '.convertDriveFile(document.getElementById("u").value,d);}</script>'
   ).setTitle('Master format converter');
 }
 
 /**
- * Converts a Drive file (.xlsx or Google Sheet) and saves the result as a new
- * file in the same folder. Returns the new file's URL.
+ * Converts a Drive file (.xlsx or Google Sheet) in place: the same file is
+ * overwritten, no new file is created. Returns the file's URL.
  */
 function convertDriveFile(urlOrId, direction) {
   var id = fileIdFromUrl_(urlOrId);
-  var src = DriveApp.getFileById(id);
-  var mime = src.getMimeType();
-  if (mime !== XLSX_MIME && mime !== GSHEET_MIME) {
-    throw new Error('Not an .xlsx or Google Sheet: ' + src.getName());
-  }
-  var baseName = src.getName().replace(/\.xlsx$/i, '');
-  var suffix = direction === 'compact' ? ' (Compact)' : ' (Expanded)';
-  var parents = src.getParents();
-  var folder = parents.hasNext() ? parents.next() : DriveApp.getRootFolder();
-
-  // Working copy as a Google Sheet (.xlsx is converted by the Drive API).
-  var tmpId = driveApi_('post', id + '/copy?supportsAllDrives=true', {
-    name: baseName + suffix,
-    mimeType: GSHEET_MIME,
-    parents: [folder.getId()]
-  }).id;
-
-  convertSpreadsheet_(SpreadsheetApp.openById(tmpId), direction);
-  SpreadsheetApp.flush();
+  var file = DriveApp.getFileById(id);
+  var mime = file.getMimeType();
 
   if (mime === GSHEET_MIME) {
-    return DriveApp.getFileById(tmpId).getUrl();
+    convertSpreadsheet_(SpreadsheetApp.openById(id), direction);
+    return file.getUrl();
+  }
+  if (mime !== XLSX_MIME) {
+    throw new Error('Not an .xlsx or Google Sheet: ' + file.getName());
   }
 
-  // Original was .xlsx: export back to .xlsx and remove the working copy.
-  var blob = UrlFetchApp.fetch(
-    'https://www.googleapis.com/drive/v3/files/' + tmpId +
-      '/export?mimeType=' + encodeURIComponent(XLSX_MIME),
-    { headers: { Authorization: 'Bearer ' + ScriptApp.getOAuthToken() } }
-  ).getBlob().setName(baseName + suffix + '.xlsx');
-  var out = folder.createFile(blob);
-  DriveApp.getFileById(tmpId).setTrashed(true);
-  return out.getUrl();
+  // .xlsx: Apps Script cannot edit it directly, so work on a temporary
+  // Google Sheet copy, then write the result back into the same .xlsx file.
+  var tmpId = driveApi_('post', id + '/copy?supportsAllDrives=true', {
+    name: 'tmp-master-convert-' + id,
+    mimeType: GSHEET_MIME
+  }).id;
+  try {
+    convertSpreadsheet_(SpreadsheetApp.openById(tmpId), direction);
+    SpreadsheetApp.flush();
+    var xlsx = UrlFetchApp.fetch(
+      'https://www.googleapis.com/drive/v3/files/' + tmpId +
+        '/export?mimeType=' + encodeURIComponent(XLSX_MIME),
+      { headers: { Authorization: 'Bearer ' + ScriptApp.getOAuthToken() } }
+    ).getBlob();
+    var res = UrlFetchApp.fetch(
+      'https://www.googleapis.com/upload/drive/v3/files/' + id +
+        '?uploadType=media&supportsAllDrives=true',
+      {
+        method: 'patch',
+        contentType: XLSX_MIME,
+        payload: xlsx.getBytes(),
+        headers: { Authorization: 'Bearer ' + ScriptApp.getOAuthToken() },
+        muteHttpExceptions: true
+      }
+    );
+    if (res.getResponseCode() >= 300) {
+      throw new Error('Could not overwrite the .xlsx: ' + res.getContentText());
+    }
+  } finally {
+    DriveApp.getFileById(tmpId).setTrashed(true);
+  }
+  return file.getUrl();
 }
 
 function driveApi_(method, path, body) {
