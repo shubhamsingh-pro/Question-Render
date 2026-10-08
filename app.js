@@ -38,8 +38,9 @@ let katexIssues = [];
 let currentCtx = null; // {label} for issue reporting
 
 function tex(src, display = false) {
-  const t = str(src).replace(/ /g, ' ');
+  let t = str(src).replace(/ /g, ' ');
   if (!t) return '';
+  if (/(^|[^\\])(\\\\)*\\$/.test(t)) t += ' '; // trimming turned a trailing "\ " (LaTeX space) into a lone "\"
   try {
     return katex.renderToString(t, {throwOnError: true, displayMode: display, strict: 'ignore', trust: false, output: 'html'});
   } catch (e) {
