@@ -419,6 +419,7 @@ function toCompact_(input, order) {
   var out = {};
   var blocks = { group: [], concept: [], topic: [], chapter: [] };
   var seen = { group: {}, concept: {}, topic: {}, chapter: {} };
+  var links = [];
   var metaLayout = layout_(input[META_SHEET].header);
 
   // Descriptive first, then the other sheets in tab order.
@@ -437,16 +438,23 @@ function toCompact_(input, order) {
         put_(qRow, L.question, q);
         out[name].push(qRow);
       }
+      var onRow = {};
       ['group', 'concept', 'topic', 'chapter'].forEach(function (k) {
         var block = getBlock_(row, sheet.header, L[k]);
         if (isBlankBlock_(block)) return;
         var key = blockKey_(block);
-        if (seen[k][key]) return;
-        seen[k][key] = true;
-        blocks[k].push(block);
+        if (!seen[k][key]) {
+          seen[k][key] = block;
+          blocks[k].push(block);
+        }
+        onRow[k] = seen[k][key];
       });
+      var qLabel = String(row[L.idx('question_label')] || '').trim();
+      noteLinks_(links, onRow, qLabel);
     });
   });
+
+  fillEmptyLinks_(links);
 
   var metaHeader = input[META_SHEET].header;
   ['group', 'concept', 'topic', 'chapter'].forEach(function (k) {
@@ -457,6 +465,49 @@ function toCompact_(input, order) {
     });
   });
   return out;
+}
+
+/*
+ * In EXPANDED form a row ties its question, group, concept, topic and chapter
+ * together just by being on the same row. In COMPACT form they sit on
+ * separate rows, so those ties must be written in the list columns
+ * (post_topics / pre_topics, topic_concept_labels, concept_question_labels,
+ * basic/intermediate/advanced_groups, group_question_labels). When a list
+ * column is completely empty, it is filled from the rows the items shared.
+ */
+function noteLinks_(links, onRow, qLabel) {
+  var t = onRow.topic, c = onRow.concept, g = onRow.group, ch = onRow.chapter;
+  var title = function (b, col) { return b ? String(b[col] || '').trim() : ''; };
+  if (ch && t) {
+    var pre = /^pre/i.test(title(t, 'pre_post_learning'));
+    links.push([ch, ['pre_topics', 'post_topics'], pre ? 'pre_topics' : 'post_topics', title(t, 'topic_title')]);
+  }
+  if (t && c) links.push([t, ['topic_concept_labels'], 'topic_concept_labels', title(c, 'concept_title')]);
+  if (c && g) {
+    var type = title(g, 'group_type').toLowerCase();
+    var col = type === 'basic' ? 'basic_groups' : type === 'advanced' ? 'advanced_groups' : 'intermediate_groups';
+    links.push([c, ['basic_groups', 'intermediate_groups', 'advanced_groups'], col, title(g, 'group_name')]);
+  }
+  if (c && qLabel) links.push([c, ['concept_question_labels'], 'concept_question_labels', qLabel]);
+  if (g && qLabel) links.push([g, ['group_question_labels'], 'group_question_labels', qLabel]);
+}
+
+function fillEmptyLinks_(links) {
+  var isEmpty = function (block, cols) {
+    return cols.every(function (c) { return !(c in block) || String(block[c]).trim() === ''; });
+  };
+  // Decide which blocks are empty before filling any of them.
+  var targets = links.filter(function (l) { return l[3] && l[2] in l[0] && isEmpty(l[0], l[1]); });
+  var lists = [];
+  targets.forEach(function (l) {
+    var entry = null;
+    for (var i = 0; i < lists.length; i++) {
+      if (lists[i].block === l[0] && lists[i].col === l[2]) { entry = lists[i]; break; }
+    }
+    if (!entry) { entry = { block: l[0], col: l[2], items: [] }; lists.push(entry); }
+    if (entry.items.indexOf(l[3]) === -1) entry.items.push(l[3]);
+  });
+  lists.forEach(function (e) { e.block[e.col] = e.items.join(' | '); });
 }
 
 /* ------------------------------------------------------------------ */
