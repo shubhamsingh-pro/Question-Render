@@ -124,6 +124,9 @@ function rich(src, ctx = {}) {
 function answerHTML(content, type) {
   const s = str(content);
   if (!s) return '';
+  // "Image" answers (or a cell that is only an image / Drive link) hold a bare URL
+  if (/^https?:\/\/\S+$/i.test(s) && (/^image$/i.test(str(type)) || driveId(s) || /\.(png|jpe?g|gif|webp|svg)(\?\S*)?$/i.test(s)))
+    return imgHTML(`src="${s.replace(/"/g, '%22')}"`) + `<a class="img-link" href="${esc(s)}" target="_blank" rel="noopener">Open image link ↗</a>`;
   if (/^equation$/i.test(str(type)) && !/\[katex\]|\[img/i.test(s)) return mixedLatex(s);
   if (!/\[katex\]/i.test(s) && /\\(text|frac|times|circ|sqrt|left|right|cdot|div)\b/.test(s)) return mixedLatex(s);
   return rich(s);
