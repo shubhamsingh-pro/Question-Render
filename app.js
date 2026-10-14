@@ -146,6 +146,7 @@ function sheetKind(name, headers) {
   return name;
 }
 
+const headerKey = c => str(c).toLowerCase().replace(/[\s\-]+/g, '_');
 /** Hidden (non-enumerable) bookkeeping on parsed rows, so it never shows up in search / raw views. */
 function hide(obj, props) { for (const [k, v] of Object.entries(props)) Object.defineProperty(obj, k, {value: v, writable: true, enumerable: false}); }
 let rowSeq = 0, sheetSeq = 0;
@@ -160,11 +161,11 @@ function parseSheets(wb, file) {
     const aoa = XLSX.utils.sheet_to_json(ws, {header: 1, raw: false, defval: '', blankrows: true});
     let hIdx = -1;
     for (let i = 0; i < Math.min(8, aoa.length); i++) {
-      const cells = aoa[i].map(c => str(c).toLowerCase());
+      const cells = aoa[i].map(headerKey);
       if (KNOWN.some(k => cells.includes(k))) { hIdx = i; break; }
     }
     if (hIdx < 0) continue;
-    const headers = aoa[hIdx].map(c => str(c).toLowerCase());
+    const headers = aoa[hIdx].map(headerKey);
     const sh = {uid: sheetSeq++, name, file, kind: sheetKind(name, headers), headers, rows: [], r0: range.s.r, c0: range.s.c, colOf: {}};
     headers.forEach((h, i) => { if (h && !(h in sh.colOf)) sh.colOf[h] = i; });
     for (let r = hIdx + 1; r < aoa.length; r++) {
@@ -479,13 +480,22 @@ function cardHTML(q, idx) {
   const blanks = blanksOf(r);
 
   const qStem = str(r.question), qText = str(r.question_text);
-  if (qStem && qText && qStem !== qText) {
+  const same = (a, b) => a.replace(/\s+/g, ' ') === b.replace(/\s+/g, ' ');
+  if (qStem && qText && !same(qStem, qText)) {
     h += blk('Question', `<div class="rich qtext"${edA(r, 'question', 'q')}>${rich(qStem, {blanks})}</div>`);
     h += blk('Question text', `<div class="rich qtext"${edA(r, 'question_text', 'q')}>${rich(qText, {blanks})}</div>`);
   } else if (qStem || qText) {
     // both columns hold the same text: editing it updates both
     const f = qStem ? 'question' : 'question_text', also = qStem && qText ? 'question_text' : '';
     h += blk('Question', `<div class="rich qtext"${edA(r, f, 'q', '', also)}>${rich(qStem || qText, {blanks})}</div>`);
+  }
+  // sub-questions belong to the question, so show them right under it (each with its own marking criteria)
+  for (let s = 1; s <= 15; s++) {
+    if (!str(r['sub_question_' + s])) continue;
+    const sc = criteria(r, `sq${s}_answer_type_`, `sq${s}_weightage_`, `sq${s}_keyword_`);
+    h += `<div class="subq"><div class="subq-h"><b>Sub-question ${s}</b>${str(r['sub_question_marks_' + s]) ? `<span class="badge">${fmtNum(r['sub_question_marks_' + s])} marks</span>` : ''}</div>` +
+         `<div class="rich"${edA(r, 'sub_question_' + s)}>${rich(r['sub_question_' + s], {blanks})}</div>` +
+         (sc.length ? `<div class="mark-only" style="margin-top:8px">${critTable(sc, r, `sq${s}_keyword_`, `sq${s}_answer_type_`)}</div>` : '') + `</div>`;
   }
   if (str(r.question_disclaimer)) h += blk('Disclaimer', `<div class="rich"${edA(r, 'question_disclaimer')}>${rich(r.question_disclaimer)}</div>`);
 
@@ -500,14 +510,8 @@ function cardHTML(q, idx) {
   if (q.kind === 'Descriptive') {
     const cr = criteria(r, 'answer_type_', 'answer_weightage_', 'answer_content_');
     if (cr.length) h += blk('Marking criteria', critTable(cr, r, 'answer_content_', 'answer_type_'), 'mark-only');
-    for (let s = 1; s <= 15; s++) {
-      if (!str(r['sub_question_' + s])) continue;
-      const sc = criteria(r, `sq${s}_answer_type_`, `sq${s}_weightage_`, `sq${s}_keyword_`);
-      h += `<div class="subq"><div class="subq-h"><b>Sub-question ${s}</b>${str(r['sub_question_marks_' + s]) ? `<span class="badge">${fmtNum(r['sub_question_marks_' + s])} marks</span>` : ''}</div>` +
-           `<div class="rich"${edA(r, 'sub_question_' + s)}>${rich(r['sub_question_' + s])}</div>` +
-           (sc.length ? `<div class="mark-only" style="margin-top:8px">${critTable(sc, r, `sq${s}_keyword_`, `sq${s}_answer_type_`)}</div>` : '') + `</div>`;
-    }
   }
+
   if (q.kind === 'Subjective') {
     const acc = [];
     for (let n = 1; n <= 40; n++) if (str(r['answer_' + n])) acc.push({n, type: str(r['answer_type_' + n]), w: str(r['weightage_' + n]), content: r['answer_' + n], ph: str(r['placeholder_' + n]), disp: str(r['answer_display_' + n])});
