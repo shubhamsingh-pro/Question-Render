@@ -52,18 +52,30 @@ function tex(src, display = false) {
 /** Raw LaTeX with \text{…} runs: render text runs as wrapping prose, the rest as inline math. */
 function mixedLatex(src) {
   const s = str(src);
-  let out = '', i = 0, mathBuf = '';
+  let out = '', i = 0, mathBuf = '', level = 0; // level = brace depth inside the current math run
   const flush = () => { if (mathBuf.trim()) out += tex(mathBuf); mathBuf = ''; };
   while (i < s.length) {
-    const m = s.slice(i).match(/^\\(?:text|textbf|mathrm)\s*\{/);
+    // Only top-level \text{…} becomes prose; inside R_{\mathrm{total}}, \frac{\text{a}}{b} etc. it stays maths.
+    const m = level === 0 && s.slice(i).match(/^\\(?:text|textbf|mathrm)\s*\{/);
     if (m) {
       let depth = 1, j = i + m[0].length;
-      while (j < s.length && depth) { if (s[j] === '{' && s[j-1] !== '\\') depth++; else if (s[j] === '}' && s[j-1] !== '\\') depth--; j++; }
+      while (j < s.length && depth) {
+        if (s[j] === '\\') { j += 2; continue; } // skip escaped chars like \{ \}
+        if (s[j] === '{') depth++; else if (s[j] === '}') depth--;
+        j++;
+      }
       const inner = s.slice(i + m[0].length, j - 1);
       flush();
-      out += esc(inner.replace(/\\([{}%$&#_])/g, '$1').replace(/\\,|~/g, ' '));
+      out += esc(inner.replace(/\\([{}%$&#_])/g, '$1')
+        .replace(/\\qquad(?![a-zA-Z])/g, '  ').replace(/\\quad(?![a-zA-Z])/g, ' ')
+        .replace(/\\;/g, ' ').replace(/\\[:>]/g, ' ').replace(/\\,/g, ' ')
+        .replace(/\\!/g, '').replace(/\\ |~/g, ' '));
       i = j;
-    } else { mathBuf += s[i++]; }
+    } else if (s[i] === '\\') { mathBuf += s.slice(i, i + 2); i += 2; } // keep escapes (\{, \;) intact
+    else {
+      if (s[i] === '{') level++; else if (s[i] === '}') level = Math.max(0, level - 1);
+      mathBuf += s[i++];
+    }
   }
   flush();
   return out;
